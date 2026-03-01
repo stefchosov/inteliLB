@@ -1,0 +1,612 @@
+================================================================================
+  inteliLB — RUNBOOK
+  Intelligent Load Balancer Research Project
+================================================================================
+
+This runbook covers everything from first-time setup through running all
+experiments and collecting results for analysis.
+
+The experiment compares 6 load balancing algorithms across 3 backends with
+intentionally asymmetric CPU capacity (1 / 2 / 4 cores) to measure how well
+each algorithm adapts to real-world resource constraints.
+
+--------------------------------------------------------------------------------
+CONTENTS
+--------------------------------------------------------------------------------
+  PART 1 — Prerequisites & First-Time Setup
+  PART 2 — Local Smoke Test (Docker Compose)
+  PART 3 — Cloud Deployment
+      3A — AWS
+      3B — Azure
+  PART 4 — Running the Load Balancer Locally
+  PART 5 — Experiment Protocol
+  PART 6 — Collecting Results
+  PART 7 — Teardown
+  APPENDIX — Troubleshooting
+
+================================================================================
+PART 1 — PREREQUISITES & FIRST-TIME SETUP
+================================================================================
+
+--- Software required --------------------------------------------------------
+
+  Go 1.21+          https://go.dev/dl/
+  Docker Desktop    https://www.docker.com/products/docker-desktop/
+  Git               https://git-scm.com/
+
+  For cloud deployment (pick one):
+    AWS CLI v2      https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html
+    Azure CLI       https://docs.microsoft.com/en-us/cli/azure/install-azure-cli
+
+  Utilities:
+    jq              brew install jq  /  apt install jq  /  winget install jqlang.jq
+    curl            (usually pre-installed)
+
+--- Verify installs ----------------------------------------------------------
+
+  go version           # expect go1.21.x or higher
+  docker --version     # expect 24.x or higher
+  aws --version        # if using AWS
+  az --version         # if using Azure
+
+--- Project setup ------------------------------------------------------------
+
+  1. Navigate to the project directory:
+
+       cd path/to/inteliLB
+
+  2. Download Go dependencies and generate go.sum:
+
+       go mod tidy
+
+     Expected: no errors, go.sum file created.
+
+  3. Verify the project builds:
+
+       go build ./...
+
+     Expected: no output (silent = success).
+
+================================================================================
+PART 2 — LOCAL SMOKE TEST (DOCKER COMPOSE)
+================================================================================
+
+Use this to verify everything works before spending money on cloud resources.
+Docker Compose runs all 3 backends + the LB on your machine with the same
+1/2/4 CPU limits enforced via Docker cgroups.
+
+--- Start all services -------------------------------------------------------
+
+  docker-compose up --build
+
+  Wait until you see all four services print their startup messages:
+    "backend backend-1 (us-east) listening on :8080"
+    "backend backend-2 (us-west) listening on :8080"
+    "backend backend-3 (eu-west) listening on :8080"
+    "load balancer starting on :8080 ..."
+
+--- Smoke tests (run in a second terminal) -----------------------------------
+
+  # Check the LB routes a request
+  curl http://localhost:8080/work?intensity=3
+
+  Expected response:
+    {"result":"<hash>","duration_ms":<n>,"region":"us-east","id":"backend-1"}
+
+  # Check the stats endpoint
+  curl http://localhost:8080/lb/stats | python3 -m json.tool
+
+  # Verify all 3 backends are healthy in the stats output — look for:
+  #   "healthy": true   on all three backends
+
+  # Verify CPU limits are in effect — check num_cpus per backend
+  curl http://localhost:8081/metrics   # expect "num_cpus": 1
+  curl http://localhost:8082/metrics   # expect "num_cpus": 2
+  curl http://localhost:8083/metrics   # expect "num_cpus": 4
+  (Note: ports 8081/8082/8083 are only accessible in docker-compose mode)
+
+--- Stop local services ------------------------------------------------------
+
+  Ctrl+C  (or docker-compose down in another terminal)
+
+================================================================================
+PART 3A — CLOUD DEPLOYMENT: AWS
+================================================================================
+
+Skip to 3B if using Azure.
+
+--- One-time: AWS credentials ------------------------------------------------
+
+  aws configure
+  # Enter: AWS Access Key ID, Secret Access Key, region (us-east-1), output (json)
+
+--- One-time: Create EC2 key pairs (needed in each region) -------------------
+
+  for region in us-east-1 us-west-2 eu-west-1; do
+    aws ec2 create-key-pair \
+      --region $region \
+      --key-name inteliLB-key \
+      --query KeyMaterial \
+      --output text > ~/.ssh/inteliLB-key.pem
+  done
+
+  chmod 400 ~/.ssh/inteliLB-key.pem
+
+  NOTE: The key material is the same content but you must create the key pair
+  resource in each region separately. Run the loop as shown.
+
+--- Deploy backends to AWS ---------------------------------------------------
+
+  ./scripts/deploy.sh --provider aws \
+    --key-name inteliLB-key \
+    --key-file ~/.ssh/inteliLB-key.pem
+
+  This will:
+    1. Find the latest Amazon Linux 2023 AMI in each region
+    2. Create security groups (ports 22 + 8080 open)
+    3. Launch EC2 instances:
+         us-east-1  backend-1  t3.medium  (1 docker CPU)
+         us-west-2  backend-2  t3.medium  (2 docker CPUs)
+         eu-west-1  backend-3  t3.xlarge  (4 docker CPUs)
+    4. Wait for instances to be reachable
+    5. Copy source, build Docker image, start container on each
+    6. Print the go run command with your backend IPs
+
+  Expected total time: 5–8 minutes.
+
+  SAVE THE OUTPUT. The final block prints your backend URLs, e.g.:
+    go run ./cmd/loadbalancer \
+      -port=8080 \
+      -algorithm=intelligent \
+      -backends="http://3.91.x.x:8080,http://54.68.x.x:8080,http://34.245.x.x:8080"
+
+--- Verify backends are reachable --------------------------------------------
+
+  # Replace IPs with yours from the deploy output
+  curl http://<us-east-ip>:8080/health
+  curl http://<us-west-ip>:8080/health
+  curl http://<eu-west-ip>:8080/health
+
+  Each should return: {"status":"ok","region":"...","id":"backend-N"}
+
+  # Check CPU counts match expectations
+  curl http://<us-east-ip>:8080/metrics   # expect "num_cpus": 1
+  curl http://<us-west-ip>:8080/metrics   # expect "num_cpus": 2
+  curl http://<eu-west-ip>:8080/metrics   # expect "num_cpus": 4
+
+================================================================================
+PART 3B — CLOUD DEPLOYMENT: AZURE
+================================================================================
+
+Skip to Part 4 if you completed Part 3A.
+
+--- One-time: Azure login ----------------------------------------------------
+
+  az login
+  # A browser window opens — sign in with your student account.
+
+  # Verify your subscription shows the $100 student credit:
+  az account show --output table
+
+--- One-time: SSH key (if you don't already have one) -----------------------
+
+  ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa
+  # Press Enter for no passphrase (or set one if you prefer)
+
+--- Deploy backends to Azure -------------------------------------------------
+
+  ./scripts/deploy.sh --provider azure --key-file ~/.ssh/id_rsa.pub
+
+  This will:
+    1. Create 3 resource groups (one per region)
+    2. Create VMs:
+         eastus       backend-1  Standard_B1ms  (1 docker CPU)  ~$0.021/hr
+         westus2      backend-2  Standard_B2s   (2 docker CPUs) ~$0.042/hr
+         westeurope   backend-3  Standard_B4ms  (4 docker CPUs) ~$0.166/hr
+    3. Open port 8080 on each VM
+    4. Copy source, build Docker image, start container on each
+    5. Print the go run command with your backend IPs
+
+  Expected total time: 8–12 minutes (Azure VM provisioning is slower than EC2).
+
+  SAVE THE OUTPUT — it contains your backend URLs.
+
+--- Verify backends are reachable --------------------------------------------
+
+  curl http://<eastus-ip>:8080/health
+  curl http://<westus2-ip>:8080/health
+  curl http://<westeurope-ip>:8080/health
+
+  # Check CPU counts match expectations
+  curl http://<eastus-ip>:8080/metrics      # expect "num_cpus": 1
+  curl http://<westus2-ip>:8080/metrics     # expect "num_cpus": 2
+  curl http://<westeurope-ip>:8080/metrics  # expect "num_cpus": 4
+
+================================================================================
+PART 4 — RUNNING THE LOAD BALANCER LOCALLY
+================================================================================
+
+The LB runs on your machine and proxies to the cloud backends.
+
+--- Start the load balancer --------------------------------------------------
+
+  Use the command printed at the end of the deploy script. Example:
+
+    go run ./cmd/loadbalancer \
+      -port=8080 \
+      -algorithm=intelligent \
+      -backends="http://<ip1>:8080,http://<ip2>:8080,http://<ip3>:8080"
+
+  Leave this running in its own terminal for the entire experiment session.
+
+--- Verify end-to-end routing ------------------------------------------------
+
+  curl http://localhost:8080/work?intensity=3
+  curl http://localhost:8080/lb/stats | python3 -m json.tool
+
+  The stats should show all 3 backends as healthy with real latency values
+  (not zero) reflecting actual cross-region round-trip times.
+
+  Typical cross-region RTTs:
+    Your machine → us-east:    10–60ms   (depends on your location)
+    Your machine → us-west:    50–120ms
+    Your machine → eu-west:    80–200ms
+
+================================================================================
+PART 5 — EXPERIMENT PROTOCOL
+================================================================================
+
+The goal is to compare all 6 algorithms under identical load, capturing enough
+data to draw statistically meaningful conclusions.
+
+--- Algorithms to test -------------------------------------------------------
+
+  1. round_robin
+  2. lowest_latency
+  3. least_connections
+  4. lowest_cpu
+  5. intelligent
+  6. adaptive
+
+--- Recommended parameters ---------------------------------------------------
+
+  Workers  : 20       (20 concurrent clients — enough to saturate backend-1)
+  Duration : 120s     (2 minutes per run — gives adaptive time to adjust)
+  Intensity: 7        (high CPU load, stress-tests the asymmetric backends)
+
+  Rationale: at intensity=7 with 20 workers, backend-1 (1 core) will approach
+  100% CPU while backend-3 (4 cores) stays well below 50%. This is the
+  condition where intelligent/adaptive routing provides the most benefit.
+
+--- Running the experiments --------------------------------------------------
+
+  Create a results directory first:
+
+    mkdir -p results
+
+  Run each algorithm in sequence. Between runs, wait ~30 seconds for backends
+  to cool down (CPU % to drop back to idle).
+
+  ALGORITHM 1: round_robin
+  ------------------------
+
+    # Switch the LB to round_robin
+    curl -s -X POST http://localhost:8080/lb/algorithm \
+      -H "Content-Type: application/json" \
+      -d '{"algorithm":"round_robin"}'
+
+    # Run the load test
+    go run ./cmd/client \
+      -url=http://localhost:8080 \
+      -workers=20 \
+      -duration=120s \
+      -intensity=7 \
+      -output=results/round_robin.csv
+
+    # Save a stats snapshot
+    curl -s http://localhost:8080/lb/stats > results/round_robin_stats.json
+
+    # Wait for cooldown
+    sleep 30
+
+  ALGORITHM 2: lowest_latency
+  ---------------------------
+
+    curl -s -X POST http://localhost:8080/lb/algorithm \
+      -H "Content-Type: application/json" \
+      -d '{"algorithm":"lowest_latency"}'
+
+    go run ./cmd/client \
+      -url=http://localhost:8080 \
+      -workers=20 \
+      -duration=120s \
+      -intensity=7 \
+      -output=results/lowest_latency.csv
+
+    curl -s http://localhost:8080/lb/stats > results/lowest_latency_stats.json
+    sleep 30
+
+  ALGORITHM 3: least_connections
+  -------------------------------
+
+    curl -s -X POST http://localhost:8080/lb/algorithm \
+      -H "Content-Type: application/json" \
+      -d '{"algorithm":"least_connections"}'
+
+    go run ./cmd/client \
+      -url=http://localhost:8080 \
+      -workers=20 \
+      -duration=120s \
+      -intensity=7 \
+      -output=results/least_connections.csv
+
+    curl -s http://localhost:8080/lb/stats > results/least_connections_stats.json
+    sleep 30
+
+  ALGORITHM 4: lowest_cpu
+  ------------------------
+
+    curl -s -X POST http://localhost:8080/lb/algorithm \
+      -H "Content-Type: application/json" \
+      -d '{"algorithm":"lowest_cpu"}'
+
+    go run ./cmd/client \
+      -url=http://localhost:8080 \
+      -workers=20 \
+      -duration=120s \
+      -intensity=7 \
+      -output=results/lowest_cpu.csv
+
+    curl -s http://localhost:8080/lb/stats > results/lowest_cpu_stats.json
+    sleep 30
+
+  ALGORITHM 5: intelligent
+  -------------------------
+
+    curl -s -X POST http://localhost:8080/lb/algorithm \
+      -H "Content-Type: application/json" \
+      -d '{"algorithm":"intelligent"}'
+
+    go run ./cmd/client \
+      -url=http://localhost:8080 \
+      -workers=20 \
+      -duration=120s \
+      -intensity=7 \
+      -output=results/intelligent.csv
+
+    curl -s http://localhost:8080/lb/stats > results/intelligent_stats.json
+    sleep 30
+
+  ALGORITHM 6: adaptive
+  ----------------------
+
+    curl -s -X POST http://localhost:8080/lb/algorithm \
+      -H "Content-Type: application/json" \
+      -d '{"algorithm":"adaptive"}'
+
+    # NOTE: adaptive adjusts its weights every 30s — run for 120s to capture
+    # at least 3 adjustment cycles.
+    go run ./cmd/client \
+      -url=http://localhost:8080 \
+      -workers=20 \
+      -duration=120s \
+      -intensity=7 \
+      -output=results/adaptive.csv
+
+    curl -s http://localhost:8080/lb/stats > results/adaptive_stats.json
+
+--- Optional: second pass at higher load -------------------------------------
+
+  Repeat the above with -workers=50 and save to results/high_load/ to show
+  how algorithms degrade differently under saturation. This is particularly
+  compelling for showing round_robin vs intelligent.
+
+    mkdir -p results/high_load
+    # same commands, change -output=results/high_load/<algorithm>.csv
+
+================================================================================
+PART 6 — COLLECTING RESULTS
+================================================================================
+
+After all runs you will have:
+
+  results/
+  ├── round_robin.csv
+  ├── round_robin_stats.json
+  ├── lowest_latency.csv
+  ├── lowest_latency_stats.json
+  ├── least_connections.csv
+  ├── least_connections_stats.json
+  ├── lowest_cpu.csv
+  ├── lowest_cpu_stats.json
+  ├── intelligent.csv
+  ├── intelligent_stats.json
+  ├── adaptive.csv
+  └── adaptive_stats.json
+
+--- CSV format (per row) -----------------------------------------------------
+
+  timestamp_ms,duration_ms,error
+  1709000000000,142.00,false
+  1709000000150,89.00,false
+  ...
+
+  - timestamp_ms  : Unix epoch milliseconds when the request started
+  - duration_ms   : End-to-end latency (includes network to backend + compute)
+  - error         : true if HTTP 5xx or connection failure
+
+--- Stats JSON format --------------------------------------------------------
+
+  {
+    "algorithm": "intelligent",
+    "total_requests": 1840,
+    "backends": [
+      {
+        "id": "backend-1", "region": "us-east-1",
+        "healthy": true,
+        "cpu_percent": 94.2,         <-- high on 1-core backend
+        "avg_latency_ms": 287.4,
+        "total_requests": 210,       <-- fewer requests sent here
+        "failed_requests": 3
+      },
+      {
+        "id": "backend-2", "region": "us-west-2",
+        "cpu_percent": 61.8,
+        "avg_latency_ms": 198.1,
+        "total_requests": 580,
+        ...
+      },
+      {
+        "id": "backend-3", "region": "eu-west-1",
+        "cpu_percent": 38.5,         <-- low on 4-core backend
+        "avg_latency_ms": 143.6,
+        "total_requests": 1050,      <-- most requests sent here
+        ...
+      }
+    ]
+  }
+
+--- Key metrics for your analysis table --------------------------------------
+
+  From each *_stats.json, extract per algorithm:
+    - total_requests
+    - per-backend request distribution (% of total)
+    - per-backend avg_latency_ms
+    - per-backend cpu_percent at end of run
+
+  From each *.csv, compute:
+    - p50 latency
+    - p95 latency
+    - p99 latency
+    - error rate (% of rows where error=true)
+    - throughput (total rows / 120 seconds = req/s)
+
+  Quick Python snippet to compute percentiles from a CSV:
+
+    python3 - <<'EOF'
+    import csv, sys
+    rows = list(csv.DictReader(open(sys.argv[1])))
+    lats = sorted(float(r['duration_ms']) for r in rows if r['error']=='false')
+    n = len(lats)
+    errs = sum(1 for r in rows if r['error']=='true')
+    print(f"n={len(rows)}  errors={errs}  "
+          f"p50={lats[int(n*.50)]:.1f}  "
+          f"p95={lats[int(n*.95)]:.1f}  "
+          f"p99={lats[int(n*.99)]:.1f} ms")
+    EOF
+    # Usage: python3 - results/intelligent.csv
+
+--- Suggested analysis angles ------------------------------------------------
+
+  1. LATENCY COMPARISON
+     Bar chart: p50 / p95 / p99 for all 6 algorithms side by side.
+     Expected result: intelligent and adaptive outperform round_robin
+     especially at p99.
+
+  2. REQUEST DISTRIBUTION
+     Stacked bar: % of requests sent to each backend per algorithm.
+     Expected result: round_robin is exactly 33/33/33. intelligent/adaptive
+     send far fewer requests to backend-1 (1 core).
+
+  3. CPU UTILIZATION PER BACKEND
+     Grouped bar: cpu_percent on each backend per algorithm.
+     Expected result: round_robin drives backend-1 into saturation (>90%).
+     intelligent/adaptive keep all backends more evenly utilized.
+
+  4. ERROR RATE
+     Simple table or bar chart. round_robin will have the highest error rate
+     because backend-1 gets overwhelmed and starts failing.
+
+  5. ADAPTIVE WEIGHT EVOLUTION (qualitative)
+     Describe how adaptive detects high CPU variance and shifts weight toward
+     the CPU metric, effectively becoming lowest_cpu. This demonstrates
+     self-tuning behavior.
+
+================================================================================
+PART 7 — TEARDOWN
+================================================================================
+
+IMPORTANT: Run teardown as soon as you are done collecting results.
+Every hour the cloud resources run costs money against your credit.
+
+--- Stop the local LB --------------------------------------------------------
+
+  Ctrl+C  in the terminal running go run ./cmd/loadbalancer
+
+--- Destroy cloud infrastructure --------------------------------------------
+
+  # AWS
+  ./scripts/deploy.sh --provider aws --teardown
+
+  # Azure
+  ./scripts/deploy.sh --provider azure --teardown
+
+  Azure teardown is asynchronous — it queues deletion and returns immediately.
+  Check the Azure portal after a few minutes to confirm the resource groups
+  are gone.
+
+--- Verify teardown (AWS) ----------------------------------------------------
+
+  aws ec2 describe-instances \
+    --region us-east-1 \
+    --filters "Name=tag:Project,Values=inteliLB" \
+    --query "Reservations[].Instances[].State.Name" \
+    --output text
+  # Expect: "terminated" (or empty)
+  # Repeat for us-west-2 and eu-west-1
+
+--- Verify teardown (Azure) --------------------------------------------------
+
+  az group list --query "[?contains(name,'inteliLB')].{Name:name,State:properties.provisioningState}" -o table
+  # Expect: no rows (or "Deleting" briefly, then disappears)
+
+================================================================================
+APPENDIX — TROUBLESHOOTING
+================================================================================
+
+PROBLEM: "no healthy backends" from the LB
+  -> Backend may still be starting. Wait 30s and retry.
+  -> Check backend is reachable: curl http://<ip>:8080/health
+  -> Check Docker container is running on the backend VM:
+       ssh -i ~/.ssh/inteliLB-key.pem ec2-user@<ip>     # AWS
+       ssh azureuser@<ip>                                 # Azure
+       sudo docker ps
+       sudo docker logs inteliLB-backend
+
+PROBLEM: SSH connection refused during deploy
+  -> Wait another 30–60s for the VM to finish booting, then re-run:
+       AWS:   PUBLIC_IP=<ip> SSH_USER=ec2-user KEY_FILE=~/.ssh/inteliLB-key.pem \
+                REGION=us-east-1 ID=backend-1 DOCKER_CPUS=1 \
+                ./scripts/deploy-backend.sh
+       Azure: PUBLIC_IP=<ip> SSH_USER=azureuser KEY_FILE=~/.ssh/id_rsa \
+                REGION=eastus ID=backend-1 DOCKER_CPUS=1 \
+                ./scripts/deploy-backend.sh
+
+PROBLEM: go mod tidy fails
+  -> Ensure you have Go 1.21+ installed and $GOPATH/bin is in your PATH.
+  -> Try: GOFLAGS="-mod=mod" go mod tidy
+
+PROBLEM: Docker build fails on the remote VM
+  -> SSH in and check Docker is running: sudo systemctl status docker
+  -> Check disk space: df -h  (t3.micro can be tight)
+  -> Free up space: sudo docker system prune -f
+
+PROBLEM: backend-1 (1 core) shows num_cpus > 1
+  -> Docker CPU limits require the host to have at least that many CPUs.
+  -> For local docker-compose, your machine needs 4+ cores for the limits
+     to be meaningful. Check: docker info | grep CPUs
+  -> On AWS/Azure, the instance types chosen have the correct vCPU counts.
+
+PROBLEM: adaptive algorithm not changing weights
+  -> Adaptive recalculates every 30s. Run the test for at least 90s.
+  -> Weights only change if there is measurable variance between backends.
+     Ensure intensity is high enough (7+) to create CPU differences.
+
+PROBLEM: results CSV is empty
+  -> The test may have ended before any requests completed.
+  -> Check the LB is actually running and reachable.
+  -> Try a quick manual test first: curl http://localhost:8080/work
+
+================================================================================
+END OF RUNBOOK
+================================================================================

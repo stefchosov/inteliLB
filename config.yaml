@@ -1,0 +1,30 @@
+# inteliLB default configuration
+# All values can be overridden with CLI flags or environment variables.
+
+load_balancer:
+  port: 8080
+  algorithm: intelligent        # round_robin | lowest_latency | lowest_cpu | least_connections | intelligent | adaptive
+  poll_interval_s: 5            # seconds between /metrics polls
+  health_interval_s: 5          # seconds between /health checks
+
+backends:
+  - url: http://localhost:8081
+    id: backend-1
+    region: us-east
+  - url: http://localhost:8082
+    id: backend-2
+    region: us-west
+  - url: http://localhost:8083
+    id: backend-3
+    region: eu-west
+
+intelligent_weights:
+  latency: 0.4
+  cpu: 0.4
+  connections: 0.2
+
+client:
+  workers: 10
+  duration: 30s
+  intensity: 5
+  output: results.csv

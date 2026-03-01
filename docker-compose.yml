@@ -1,0 +1,68 @@
+version: "3.9"
+
+services:
+  lb:
+    build:
+      context: .
+      dockerfile: Dockerfile.lb
+    ports:
+      - "8080:8080"
+    environment:
+      ALGORITHM: intelligent
+      BACKENDS: "http://backend-1:8080,http://backend-2:8080,http://backend-3:8080"
+    depends_on:
+      - backend-1
+      - backend-2
+      - backend-3
+    restart: unless-stopped
+
+  backend-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      REGION: us-east
+      ID: backend-1
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+    restart: unless-stopped
+
+  backend-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      REGION: us-west
+      ID: backend-2
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+    restart: unless-stopped
+
+  backend-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      REGION: eu-west
+      ID: backend-3
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+    restart: unless-stopped
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    environment:
+      TARGET_URL: "http://lb:8080"
+    depends_on:
+      - lb
+    profiles:
+      - client
+    command: ["-url", "http://lb:8080", "-workers", "10", "-duration", "60s", "-intensity", "5"]
