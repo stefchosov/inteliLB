@@ -34,25 +34,31 @@ launch_vm() {
   echo "  Resource group: $rg"
 
   # Create VM
+  echo "  [debug] az vm create: rg=$rg id=$id location=$location size=$vm_size"
+  set -x
   az vm create \
     --resource-group "$rg" \
     --name "$id" \
     --location "$location" \
-    --image "Ubuntu2204" \
+    --image "Canonical:0001-com-ubuntu-server-jammy:22_04-lts:latest" \
     --size "$vm_size" \
     --admin-username azureuser \
     --generate-ssh-keys \
     --public-ip-sku Standard \
     --output none
+  set +x
 
-  # Fetch public IP separately (avoids --query + --output tsv parsing issues)
+  # Fetch public IP separately
   local public_ip
+  echo "  [debug] fetching public IP for $id..."
+  set -x
   public_ip=$(az vm show \
     --resource-group "$rg" \
     --name "$id" \
     --show-details \
     --query "publicIps" \
     --output tsv)
+  set +x
 
   echo "  VM created — opening port 8080..."
   az vm open-port \
