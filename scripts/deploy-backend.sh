@@ -45,9 +45,7 @@ chmod +x /tmp/inteliLB-backend
 pkill -f inteliLB-backend 2>/dev/null || true
 sleep 1
 
-sudo mv /tmp/inteliLB-backend /usr/local/bin/inteliLB-backend
-
-nohup sudo -E env REGION="$REGION" ID="$ID" ${TASKSET_PREFIX}/usr/local/bin/inteliLB-backend -port=8080 \
+nohup env REGION="$REGION" ID="$ID" ${TASKSET_PREFIX}/tmp/inteliLB-backend -port=8080 \
   > /tmp/inteliLB-backend.log 2>&1 &
 
 echo "Backend $ID started on port 8080 (PID \$!)"
