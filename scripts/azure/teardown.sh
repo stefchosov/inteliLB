@@ -9,7 +9,8 @@ RESOURCE_GROUPS=(
   "inteliLB-westus2"
   "inteliLB-northeurope"
   "inteliLB-westeurope"
-  "inteliLB-eastus2"
+  "inteliLB-eastus"
+  "inteliLB-centralus"
 )
 
 if ! az account show &>/dev/null; then
