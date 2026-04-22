@@ -5,6 +5,10 @@
 #   ./scripts/azure/check-skus.sh
 #
 # Exit code 0 = all SKUs available, 1 = one or more unavailable.
+#
+# Note: az vm list-skus catches policy/subscription restrictions only.
+# Real-time capacity exhaustion (SkuNotAvailable) is NOT detectable here —
+# it only surfaces during an actual deployment attempt.
 
 set -euo pipefail
 
@@ -16,34 +20,33 @@ declare -a CHECKS=(
   "westeurope  Standard_B4ms  backend-3   4-vCPU"
 )
 
-# Ordered fallback SKUs per vCPU tier (cheapest first)
-declare -A FALLBACKS
-FALLBACKS["1"]="Standard_B1ms Standard_B1s Standard_A1_v2 Standard_D2s_v5"
-FALLBACKS["2"]="Standard_B2s Standard_B2ms Standard_A2_v2 Standard_D2s_v5"
-FALLBACKS["4"]="Standard_B4ms Standard_B4s_v2 Standard_A4_v2 Standard_D4s_v5"
+SKU_CHECK_TIMEOUT=90  # seconds per az vm list-skus call
 
 if ! az account show &>/dev/null; then
   echo "Error: not logged in to Azure. Run: az login"
   exit 1
 fi
 
-check_sku() {
-  local location="$1" sku="$2"
+TMPDIR_RESULTS=$(mktemp -d)
+trap 'rm -rf "$TMPDIR_RESULTS"' EXIT
+
+# ── Parallel SKU checks ───────────────────────────────────────────────────────
+
+check_sku_to_file() {
+  local location="$1" sku="$2" outfile="$3"
   local info restriction_count
-  info=$(az vm list-skus \
+
+  info=$(timeout "$SKU_CHECK_TIMEOUT" az vm list-skus \
     --location "$location" \
     --size "$sku" \
     --resource-type "virtualMachines" \
-    --output json 2>/dev/null)
+    --output json 2>/dev/null) || { echo "TIMEOUT" > "$outfile"; return; }
 
   if [[ -z "$info" || "$info" == "[]" ]]; then
-    echo "NOT_FOUND"
+    echo "NOT_FOUND" > "$outfile"
     return
   fi
 
-  # Count ALL restrictions regardless of type — catches both policy and
-  # zone-level restrictions. Note: real-time capacity exhaustion (SkuNotAvailable)
-  # is NOT reported by az vm list-skus; only a live deployment attempt reveals it.
   restriction_count=$(echo "$info" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
@@ -52,51 +55,67 @@ print(total)
 " 2>/dev/null || echo "0")
 
   if [[ "$restriction_count" -gt 0 ]]; then
-    echo "RESTRICTED"
+    echo "RESTRICTED" > "$outfile"
   else
-    echo "OK"
+    echo "OK" > "$outfile"
   fi
 }
 
-find_fallback() {
-  local location="$1" vcpu_tier="$2"
-  for sku in ${FALLBACKS[$vcpu_tier]}; do
-    result=$(check_sku "$location" "$sku")
-    if [[ "$result" == "OK" ]]; then
-      echo "$sku"
-      return
-    fi
-  done
-  echo "NONE"
-}
+echo ""
+echo "Checking VM SKU availability (running in parallel, timeout ${SKU_CHECK_TIMEOUT}s each)..."
+echo ""
 
-echo ""
-echo "Checking VM SKU availability..."
-echo ""
+declare -a PIDS=()
+declare -a OUTFILES=()
+
+for entry in "${CHECKS[@]}"; do
+  read -r location sku backend vcpus <<< "$entry"
+  outfile="$TMPDIR_RESULTS/${backend}.txt"
+  OUTFILES+=("$outfile")
+  check_sku_to_file "$location" "$sku" "$outfile" &
+  PIDS+=($!)
+done
+
+# Progress indicator while waiting
+total=${#PIDS[@]}
+done_count=0
+while [[ $done_count -lt $total ]]; do
+  sleep 2
+  done_count=0
+  for pid in "${PIDS[@]}"; do
+    kill -0 "$pid" 2>/dev/null || done_count=$((done_count + 1))
+  done
+  printf "\r  Waiting... (%d/%d complete)" "$done_count" "$total"
+done
+printf "\r  All checks complete.              \n\n"
+
+for pid in "${PIDS[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done
+
+# ── Print results ─────────────────────────────────────────────────────────────
+
 printf "  %-12s  %-16s  %-10s  %-12s  %s\n" "Location" "SKU" "Backend" "vCPUs" "Status"
 printf "  %-12s  %-16s  %-10s  %-12s  %s\n" "--------" "---" "-------" "-----" "------"
 
 ALL_OK=true
 declare -a FAILURES=()
 
+i=0
 for entry in "${CHECKS[@]}"; do
   read -r location sku backend vcpus <<< "$entry"
-  status=$(check_sku "$location" "$sku")
+  outfile="${OUTFILES[$i]}"
+  i=$((i + 1))
+
+  status="UNKNOWN"
+  [[ -f "$outfile" ]] && status=$(cat "$outfile")
 
   if [[ "$status" == "OK" ]]; then
     printf "  %-12s  %-16s  %-10s  %-12s  OK\n" "$location" "$sku" "$backend" "$vcpus"
   else
-    tier="${vcpus%-vCPU}"
-    fallback=$(find_fallback "$location" "$tier")
-    if [[ "$fallback" != "NONE" ]]; then
-      printf "  %-12s  %-16s  %-10s  %-12s  %-12s  → use %s\n" \
-        "$location" "$sku" "$backend" "$vcpus" "$status" "$fallback"
-    else
-      printf "  %-12s  %-16s  %-10s  %-12s  %-12s  → no fallback found\n" \
-        "$location" "$sku" "$backend" "$vcpus" "$status"
-    fi
+    printf "  %-12s  %-16s  %-10s  %-12s  %s\n" "$location" "$sku" "$backend" "$vcpus" "$status"
     ALL_OK=false
-    FAILURES+=("$location|$sku|$backend|$vcpus|$fallback")
+    FAILURES+=("$location|$sku|$backend|$vcpus")
   fi
 done
 
@@ -109,13 +128,9 @@ else
   echo "Fix required — update BACKENDS in scripts/azure/launch.sh:"
   echo ""
   for failure in "${FAILURES[@]}"; do
-    IFS='|' read -r location sku backend vcpus fallback <<< "$failure"
-    if [[ "$fallback" != "NONE" ]]; then
-      echo "  $backend ($location): change $sku → $fallback"
-    else
-      echo "  $backend ($location): $sku unavailable and no fallback found in this region"
-      echo "    Try a different region. Available regions: eastus2, westus2, westeurope, centralus, northeurope"
-    fi
+    IFS='|' read -r location sku backend vcpus <<< "$failure"
+    echo "  $backend ($location): $sku is RESTRICTED or NOT_FOUND in this region"
+    echo "    Try a different region or SKU."
   done
   echo ""
   exit 1
