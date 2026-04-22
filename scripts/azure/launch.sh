@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # azure/launch.sh — Creates Azure VMs in 3 regions for inteliLB backends.
 #
-# CPU layout (enforced by VM size, no Docker required):
-#   eastus2      backend-1   Standard_B1s   — 1 vCPU
-#   westus2      backend-2   Standard_B2s   — 2 vCPUs
-#   westeurope   backend-3   Standard_B4ms  — 4 vCPUs
+# CPU layout:
+#   eastus2      backend-1   Standard_D2s_v5  — 2 vCPU VM, pinned to 1 core via taskset
+#   westus2      backend-2   Standard_D2s_v5  — 2 vCPUs
+#   westeurope   backend-3   Standard_D4s_v5  — 4 vCPUs
 #
 # Expects KEY_FILE (path to SSH public key) to be set by deploy.sh.
 
@@ -15,12 +15,13 @@ STATE_FILE="/tmp/inteliLB-azure-instances.txt"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # location  resource_group  id  vm_size
-# backend-1 uses Standard_B2s (taskset pins it to 1 core in deploy-backend.sh,
-# simulating 1-vCPU behavior — avoids Standard_B1s capacity exhaustion)
+# All backends use Dv5-series — B-series has pervasive capacity exhaustion on
+# Azure for Students. backend-1 is still pinned to 1 core via taskset in
+# deploy-backend.sh to simulate 1-vCPU behavior.
 declare -a BACKENDS=(
-  "eastus2     inteliLB-eastus2     backend-1   Standard_B2s"
-  "westus2     inteliLB-westus2     backend-2   Standard_B2s"
-  "westeurope  inteliLB-westeurope  backend-3   Standard_B4ms"
+  "eastus2     inteliLB-eastus2     backend-1   Standard_D2s_v5"
+  "westus2     inteliLB-westus2     backend-2   Standard_D2s_v5"
+  "westeurope  inteliLB-westeurope  backend-3   Standard_D4s_v5"
 )
 
 launch_vm() {
