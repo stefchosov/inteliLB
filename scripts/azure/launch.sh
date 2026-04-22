@@ -18,7 +18,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # backend-1 uses Standard_B2s (taskset pins it to 1 core in deploy-backend.sh,
 # simulating 1-vCPU behavior — avoids Standard_B1s capacity exhaustion)
 declare -a BACKENDS=(
-  "centralus   inteliLB-centralus   backend-1   Standard_B2s"
+  "eastus2     inteliLB-eastus2     backend-1   Standard_B2s"
   "westus2     inteliLB-westus2     backend-2   Standard_B2s"
   "westeurope  inteliLB-westeurope  backend-3   Standard_B4ms"
 )
