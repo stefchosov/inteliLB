@@ -41,7 +41,7 @@ launch_vm() {
     --image "Ubuntu2204" \
     --size "$vm_size" \
     --admin-username azureuser \
-    --ssh-key-values "$(cat "$KEY_FILE")" \
+    --generate-ssh-keys \
     --public-ip-sku Standard \
     --output none
 
