@@ -30,18 +30,24 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "$BINARY" "$PROJECT_ROOT/cmd/b
 echo "  [$ID] Copying binary to $PUBLIC_IP..."
 scp $SSH_OPTS "$BINARY" "$REMOTE:/tmp/inteliLB-backend"
 
+# backend-1 is pinned to a single core to simulate 1-vCPU capacity;
+# the VM is Standard_B2s but taskset limits it to core 0 only.
+TASKSET_PREFIX=""
+if [[ "$ID" == "backend-1" ]]; then
+  TASKSET_PREFIX="taskset -c 0 "
+fi
+
 echo "  [$ID] Starting backend..."
 ssh $SSH_OPTS "$REMOTE" bash <<REMOTE_SCRIPT
 set -e
 chmod +x /tmp/inteliLB-backend
 
-# Stop any existing instance
 pkill -f inteliLB-backend 2>/dev/null || true
 sleep 1
 
 mv /tmp/inteliLB-backend /usr/local/bin/inteliLB-backend
 
-nohup env REGION="$REGION" ID="$ID" /usr/local/bin/inteliLB-backend -port=8080 \
+nohup env REGION="$REGION" ID="$ID" ${TASKSET_PREFIX}/usr/local/bin/inteliLB-backend -port=8080 \
   > /var/log/inteliLB-backend.log 2>&1 &
 
 echo "Backend $ID started on port 8080 (PID \$!)"

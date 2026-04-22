@@ -9,8 +9,9 @@
 set -euo pipefail
 
 # Must match BACKENDS in launch.sh
+# backend-1 uses Standard_B2s; taskset in deploy-backend.sh pins it to 1 core
 declare -a CHECKS=(
-  "eastus2     Standard_B1s   backend-1   1-vCPU"
+  "centralus   Standard_B2s   backend-1   2-vCPU"
   "westus2     Standard_B2s   backend-2   2-vCPU"
   "westeurope  Standard_B4ms  backend-3   4-vCPU"
 )
@@ -28,7 +29,7 @@ fi
 
 check_sku() {
   local location="$1" sku="$2"
-  local info
+  local info restriction_count
   info=$(az vm list-skus \
     --location "$location" \
     --size "$sku" \
@@ -37,7 +38,20 @@ check_sku() {
 
   if [[ -z "$info" || "$info" == "[]" ]]; then
     echo "NOT_FOUND"
-  elif echo "$info" | grep -q "NotAvailableForSubscription"; then
+    return
+  fi
+
+  # Count ALL restrictions regardless of type — catches both policy and
+  # zone-level restrictions. Note: real-time capacity exhaustion (SkuNotAvailable)
+  # is NOT reported by az vm list-skus; only a live deployment attempt reveals it.
+  restriction_count=$(echo "$info" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+total = sum(len(item.get('restrictions', [])) for item in data)
+print(total)
+" 2>/dev/null || echo "0")
+
+  if [[ "$restriction_count" -gt 0 ]]; then
     echo "RESTRICTED"
   else
     echo "OK"
