@@ -16,7 +16,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # location  resource_group  id  vm_size
 declare -a BACKENDS=(
-  "eastus      inteliLB-eastus      backend-1   Standard_B1ms"
+  "eastus2     inteliLB-eastus2     backend-1   Standard_B1ms"
   "westus2     inteliLB-westus2     backend-2   Standard_B2s"
   "westeurope  inteliLB-westeurope  backend-3   Standard_B4ms"
 )

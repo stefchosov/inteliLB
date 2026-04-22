@@ -6,7 +6,7 @@
 set -euo pipefail
 
 RESOURCE_GROUPS=(
-  "inteliLB-eastus"
+  "inteliLB-eastus2"
   "inteliLB-westus2"
   "inteliLB-westeurope"
 )
