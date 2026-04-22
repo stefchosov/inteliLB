@@ -2,7 +2,7 @@
 # azure/launch.sh — Creates Azure VMs in 3 regions for inteliLB backends.
 #
 # CPU layout (enforced by VM size, no Docker required):
-#   eastus       backend-1   Standard_B1ms  — 1 vCPU
+#   eastus2      backend-1   Standard_B1s   — 1 vCPU
 #   westus2      backend-2   Standard_B2s   — 2 vCPUs
 #   westeurope   backend-3   Standard_B4ms  — 4 vCPUs
 #
@@ -79,6 +79,15 @@ if ! az account show &>/dev/null; then
   echo "Error: not logged in to Azure. Run: az login"
   exit 1
 fi
+
+# Pre-flight: validate all SKUs are available before spending time on deployment
+echo "Running SKU availability pre-flight check..."
+if ! bash "$DIR/check-skus.sh"; then
+  echo ""
+  echo "Aborting deployment. Update launch.sh with the suggested SKUs above and retry."
+  exit 1
+fi
+echo ""
 
 rm -f "$STATE_FILE"
 
