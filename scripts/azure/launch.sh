@@ -82,15 +82,6 @@ if ! az account show &>/dev/null; then
   exit 1
 fi
 
-# Pre-flight: validate all SKUs are available before spending time on deployment
-echo "Running SKU availability pre-flight check..."
-if ! bash "$DIR/check-skus.sh"; then
-  echo ""
-  echo "Aborting deployment. Update launch.sh with the suggested SKUs above and retry."
-  exit 1
-fi
-echo ""
-
 rm -f "$STATE_FILE"
 
 for entry in "${BACKENDS[@]}"; do
