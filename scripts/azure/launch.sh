@@ -82,6 +82,36 @@ if ! az account show &>/dev/null; then
   exit 1
 fi
 
+# ── Region policy pre-flight ──────────────────────────────────────────────────
+# Create a test resource group in each target region to verify the subscription
+# policy allows it. This is instant and free, unlike az vm list-skus.
+echo "Checking region access (creating test resource groups)..."
+REGION_OK=true
+declare -A REGION_STATUS
+PROBE_SUFFIX="inteliLB-probe-$$"
+
+for entry in "${BACKENDS[@]}"; do
+  read -r location rg id vm_size <<< "$entry"
+  probe_rg="${PROBE_SUFFIX}-${location}"
+  if az group create --name "$probe_rg" --location "$location" --output none 2>/dev/null; then
+    az group delete --name "$probe_rg" --yes --no-wait 2>/dev/null || true
+    REGION_STATUS[$location]="OK"
+    echo "  $location — OK"
+  else
+    REGION_STATUS[$location]="BLOCKED"
+    echo "  $location — BLOCKED by subscription policy"
+    REGION_OK=false
+  fi
+done
+
+if ! $REGION_OK; then
+  echo ""
+  echo "One or more regions are blocked. Update BACKENDS in launch.sh to use allowed regions."
+  echo "Allowed regions for this subscription (run: az account list-locations -o table)"
+  exit 1
+fi
+echo ""
+
 rm -f "$STATE_FILE"
 
 for entry in "${BACKENDS[@]}"; do
