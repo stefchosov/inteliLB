@@ -34,8 +34,7 @@ launch_vm() {
   echo "  Resource group: $rg"
 
   # Create VM
-  local public_ip
-  public_ip=$(az vm create \
+  az vm create \
     --resource-group "$rg" \
     --name "$id" \
     --location "$location" \
@@ -44,7 +43,15 @@ launch_vm() {
     --admin-username azureuser \
     --ssh-key-values "$(cat "$KEY_FILE")" \
     --public-ip-sku Standard \
-    --query "publicIpAddress" \
+    --output none
+
+  # Fetch public IP separately (avoids --query + --output tsv parsing issues)
+  local public_ip
+  public_ip=$(az vm show \
+    --resource-group "$rg" \
+    --name "$id" \
+    --show-details \
+    --query "publicIps" \
     --output tsv)
 
   echo "  VM created — opening port 8080..."
