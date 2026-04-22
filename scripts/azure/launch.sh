@@ -2,8 +2,8 @@
 # azure/launch.sh — Creates Azure VMs in 3 regions for inteliLB backends.
 #
 # CPU layout:
-#   eastus2      backend-1   Standard_D2s_v5  — 2 vCPU VM, pinned to 1 core via taskset
-#   westus2      backend-2   Standard_D2s_v5  — 2 vCPUs
+#   westus2      backend-1   Standard_D2s_v5  — 2 vCPU VM, pinned to 1 core via taskset
+#   northeurope  backend-2   Standard_D2s_v5  — 2 vCPUs
 #   westeurope   backend-3   Standard_D4s_v5  — 4 vCPUs
 #
 # Expects KEY_FILE (path to SSH public key) to be set by deploy.sh.
@@ -19,8 +19,8 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Azure for Students. backend-1 is still pinned to 1 core via taskset in
 # deploy-backend.sh to simulate 1-vCPU behavior.
 declare -a BACKENDS=(
-  "eastus2     inteliLB-eastus2     backend-1   Standard_D2s_v5"
-  "westus2     inteliLB-westus2     backend-2   Standard_D2s_v5"
+  "westus2     inteliLB-westus2     backend-1   Standard_D2s_v5"
+  "northeurope inteliLB-northeurope backend-2   Standard_D2s_v5"
   "westeurope  inteliLB-westeurope  backend-3   Standard_D4s_v5"
 )
 
