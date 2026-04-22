@@ -116,14 +116,14 @@ log "inteliLB experiment — mode=$MODE workers=$WORKERS duration=$DURATION inte
 log "Results → $RESULTS_DIR"
 hr
 
-command -v go     >/dev/null || die "'go' not found in PATH"
-command -v curl   >/dev/null || die "'curl' not found in PATH"
+command -v go    >/dev/null || die "'go' not found in PATH"
+command -v curl  >/dev/null || die "'curl' not found in PATH"
 command -v python3 >/dev/null 2>&1 || command -v python >/dev/null \
   || die "python3 not found — needed for summary"
 
 if [[ "$MODE" == "azure" ]]; then
   command -v az >/dev/null || die "'az' not found — run: winget install Microsoft.AzureCLI"
-  az account show &>/dev/null   || die "Not logged in to Azure — run: az login"
+  az account show &>/dev/null || die "Not logged in to Azure — run: az login"
 fi
 
 # Save run config for reproducibility
@@ -174,7 +174,7 @@ if [[ "$MODE" == "local" ]]; then
   BACKEND_URLS="http://localhost:8081,http://localhost:8082,http://localhost:8083"
 
 else
-  log "Deploying Azure backends (8–12 min)..."
+  log "Deploying Azure backends (8-12 min)..."
   KEY_FILE="$KEY_FILE" bash "$PROJECT_ROOT/scripts/deploy.sh" --key-file "$KEY_FILE" \
     | tee "$RESULTS_DIR/deploy.log"
 
@@ -189,7 +189,7 @@ fi
 
 # ── Start load balancer ───────────────────────────────────────────────────────
 hr
-log "Starting load balancer on :8080 → [$BACKEND_URLS]"
+log "Starting load balancer on :8080 -> [$BACKEND_URLS]"
 
 "$PROJECT_ROOT/bin/loadbalancer" \
   -port=8080 \
@@ -203,7 +203,7 @@ wait_healthy http://localhost:8080 "load-balancer"
 
 # ── Experiment loop ────────────────────────────────────────────────────────────
 hr
-log "Running ${#ALGORITHMS[@]} algorithms × $DURATION each"
+log "Running ${#ALGORITHMS[@]} algorithms x $DURATION each"
 hr
 
 TOTAL_ALGORITHMS=${#ALGORITHMS[@]}
@@ -248,48 +248,82 @@ import csv, sys, os, json
 results_dir = sys.argv[1]
 algorithms  = sys.argv[2:]
 
-col = "{:<22} {:>6} {:>7} {:>6} {:>9} {:>9} {:>9} {:>8}"
-print(col.format("Algorithm", "n", "errors", "err%", "p50(ms)", "p95(ms)", "p99(ms)", "req/s"))
-print("-" * 82)
+def pct(vals, p):
+    if not vals:
+        return 0.0
+    return sorted(vals)[max(0, int(len(vals) * p / 100) - 1)]
 
-rows_by_algo = {}
+def load_col(rows, col, exclude_errors=True):
+    out = []
+    for r in rows:
+        if exclude_errors and r.get('error', 'false') == 'true':
+            continue
+        try:
+            v = float(r[col])
+            if v >= 0:
+                out.append(v)
+        except (KeyError, ValueError):
+            pass
+    return out
+
+# ── Total RTT + Network latency table ─────────────────────────────────────────
+col = "{:<22} {:>6} {:>6} {:>6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>7}"
+print(col.format("Algorithm", "n", "errs", "err%",
+                 "total p50", "total p95", "total p99",
+                 "net p50",   "net p95",   "net p99",   "req/s"))
+print("-" * 107)
+
 for algo in algorithms:
     path = os.path.join(results_dir, f"{algo}.csv")
     if not os.path.exists(path):
-        print(f"  {algo:<20}  (no data file)")
+        print(f"  {algo:<20}  (no data)")
         continue
 
     rows = list(csv.DictReader(open(path)))
     if not rows:
-        print(f"  {algo:<20}  (empty CSV)")
+        print(f"  {algo:<20}  (empty)")
         continue
 
-    lats = sorted(float(r['duration_ms']) for r in rows if r.get('error','false') == 'false')
-    errs = sum(1 for r in rows if r.get('error','false') == 'true')
-    n    = len(rows)
-    nl   = len(lats)
-
-    p50 = lats[max(0, int(nl * 0.50) - 1)] if nl else 0.0
-    p95 = lats[max(0, int(nl * 0.95) - 1)] if nl else 0.0
-    p99 = lats[max(0, int(nl * 0.99) - 1)] if nl else 0.0
-
-    ts      = [int(r['timestamp_ms']) for r in rows if r.get('timestamp_ms','')]
-    elapsed = (max(ts) - min(ts)) / 1000.0 if len(ts) > 1 else 1.0
-    rps     = n / elapsed if elapsed > 0 else 0.0
+    n       = len(rows)
+    errs    = sum(1 for r in rows if r.get('error', 'false') == 'true')
     err_pct = errs / n * 100 if n > 0 else 0.0
 
-    rows_by_algo[algo] = dict(n=n, errs=errs, err_pct=err_pct,
-                               p50=p50, p95=p95, p99=p99, rps=rps)
-    print(col.format(algo, n, errs, f"{err_pct:.1f}%",
-                     f"{p50:.1f}", f"{p95:.1f}", f"{p99:.1f}", f"{rps:.1f}"))
+    total   = load_col(rows, 'total_ms')
+    network = load_col(rows, 'network_ms')
 
+    ts      = [int(r['timestamp_ms']) for r in rows if r.get('timestamp_ms', '')]
+    elapsed = (max(ts) - min(ts)) / 1000.0 if len(ts) > 1 else 1.0
+    rps     = n / elapsed if elapsed > 0 else 0.0
+
+    print(col.format(
+        algo, n, errs, f"{err_pct:.1f}%",
+        f"{pct(total,50):.1f}",   f"{pct(total,95):.1f}",   f"{pct(total,99):.1f}",
+        f"{pct(network,50):.1f}", f"{pct(network,95):.1f}", f"{pct(network,99):.1f}",
+        f"{rps:.1f}"))
+
+# ── Compute latency table ─────────────────────────────────────────────────────
 print("")
+col2 = "{:<22} {:>11} {:>11} {:>11}"
+print(col2.format("Algorithm", "compute p50", "compute p95", "compute p99"))
+print("-" * 58)
+for algo in algorithms:
+    path = os.path.join(results_dir, f"{algo}.csv")
+    if not os.path.exists(path):
+        continue
+    rows    = list(csv.DictReader(open(path)))
+    compute = load_col(rows, 'compute_ms')
+    if not compute:
+        continue
+    print(col2.format(algo,
+        f"{pct(compute,50):.1f}ms",
+        f"{pct(compute,95):.1f}ms",
+        f"{pct(compute,99):.1f}ms"))
 
-# Per-algorithm backend breakdown from stats JSONs
-print("Backend distribution (% of requests per algorithm):")
+# ── Backend distribution ──────────────────────────────────────────────────────
+print("")
 dist_col = "{:<22} {:<14} {:<14} {:<14}"
 print(dist_col.format("Algorithm", "backend-1", "backend-2", "backend-3"))
-print("-" * 60)
+print("-" * 62)
 for algo in algorithms:
     spath = os.path.join(results_dir, f"{algo}_stats.json")
     if not os.path.exists(spath):
@@ -300,7 +334,7 @@ for algo in algorithms:
         total    = sum(b.get("total_requests", 0) for b in backends)
         if total == 0:
             continue
-        pcts = [f"{b.get('total_requests',0)/total*100:.1f}%" for b in backends]
+        pcts = [f"{b.get('total_requests', 0) / total * 100:.1f}%" for b in backends]
         while len(pcts) < 3:
             pcts.append("n/a")
         print(dist_col.format(algo, *pcts[:3]))
@@ -308,7 +342,7 @@ for algo in algorithms:
         pass
 
 print("")
-print(f"All results saved to: {results_dir}")
+print(f"Results saved to: {results_dir}")
 PYEOF
 
 hr
