@@ -7,10 +7,12 @@ set -euo pipefail
 
 RESOURCE_GROUPS=(
   "inteliLB-westus2"
-  "inteliLB-northeurope"
-  "inteliLB-westeurope"
+  "inteliLB-northcentralus"
+  "inteliLB-eastus2"
+  "inteliLB-southcentralus"
   "inteliLB-eastus"
   "inteliLB-centralus"
+  "inteliLB-northeurope"
 )
 
 if ! az account show &>/dev/null; then

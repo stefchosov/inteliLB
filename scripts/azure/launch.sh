@@ -2,9 +2,15 @@
 # azure/launch.sh — Creates Azure VMs in 3 regions for inteliLB backends.
 #
 # CPU layout:
-#   westus2      backend-1   Standard_D2s_v3  — 2 vCPU VM, pinned to 1 core via taskset
-#   northeurope  backend-2   Standard_D2s_v3  — 2 vCPUs
-#   westeurope   backend-3   Standard_D4s_v3  — 4 vCPUs
+#   westus2        backend-1   Standard_D2s_v3  — 2 vCPU VM, pinned to 1 core via taskset
+#   northcentralus backend-2   Standard_D2s_v3  — 2 vCPUs
+#   eastus2        backend-3   Standard_D4s_v3  — 4 vCPUs
+#
+# DSv3 quota per region is 4 vCPUs on Azure for Students — each backend
+# must be in its own region (2+2+4 cores across three separate quota pools).
+#
+# Azure for Students only permits VM resources in a small set of US regions;
+# northeurope/westeurope/etc. pass the RG probe but block NSG/NIC/VM creation.
 #
 # Expects KEY_FILE (path to SSH public key) to be set by deploy.sh.
 
@@ -19,9 +25,9 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 # Azure for Students; Dv3 is confirmed available in all target regions.
 # backend-1 is still pinned to 1 core via taskset in deploy-backend.sh.
 declare -a BACKENDS=(
-  "westus2     inteliLB-westus2     backend-1   Standard_D2s_v3"
-  "northeurope inteliLB-northeurope backend-2   Standard_D2s_v3"
-  "westeurope  inteliLB-westeurope  backend-3   Standard_D4s_v3"
+  "westus2        inteliLB-westus2        backend-1   Standard_D2s_v3"
+  "northcentralus inteliLB-northcentralus backend-2   Standard_D2s_v3"
+  "eastus2        inteliLB-eastus2        backend-3   Standard_D4s_v3"
 )
 
 launch_vm() {
@@ -95,9 +101,18 @@ for entry in "${BACKENDS[@]}"; do
   read -r location rg id vm_size <<< "$entry"
   probe_rg="${PROBE_SUFFIX}-${location}"
   if az group create --name "$probe_rg" --location "$location" --output none 2>/dev/null; then
+    # RG creation alone is not sufficient — test an actual compute resource (NSG)
+    # since Azure for Students blocks VM/NIC/NSG in some regions even if RGs succeed.
+    if az network nsg create --name probe-nsg --resource-group "$probe_rg" \
+        --location "$location" --output none 2>/dev/null; then
+      REGION_STATUS[$location]="OK"
+      echo "  $location — OK"
+    else
+      REGION_STATUS[$location]="BLOCKED"
+      echo "  $location — BLOCKED by subscription policy (VM resources denied)"
+      REGION_OK=false
+    fi
     az group delete --name "$probe_rg" --yes --no-wait 2>/dev/null || true
-    REGION_STATUS[$location]="OK"
-    echo "  $location — OK"
   else
     REGION_STATUS[$location]="BLOCKED"
     echo "  $location — BLOCKED by subscription policy"
