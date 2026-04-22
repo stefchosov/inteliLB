@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # aws/launch.sh — Launches EC2 instances in 3 regions for inteliLB backends.
 #
-# CPU layout:
-#   us-east-1   backend-1   t3.medium   → Docker --cpus=1
-#   us-west-2   backend-2   t3.medium   → Docker --cpus=2
-#   eu-west-1   backend-3   t3.xlarge   → Docker --cpus=4
+# CPU layout (enforced by instance type, no Docker required):
+#   us-east-1   backend-1   t3.small   — 2 vCPUs
+#   us-west-2   backend-2   t3.medium  — 2 vCPUs
+#   eu-west-1   backend-3   t3.xlarge  — 4 vCPUs
+#
+# Note: AWS t3 instances start at 2 vCPUs. For a 1/2/4 split use Docker --cpus
+# or switch to Azure where Standard_B1ms provides a true 1-vCPU VM.
 #
 # Expects KEY_NAME and KEY_FILE to be set by deploy.sh.
 
@@ -16,11 +19,11 @@ SG_NAME="inteliLB-backend-sg"
 STATE_FILE="/tmp/inteliLB-aws-instances.txt"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# region  id  instance_type  docker_cpus
+# region  id  instance_type
 declare -a BACKENDS=(
-  "us-east-1   backend-1   t3.medium   1"
-  "us-west-2   backend-2   t3.medium   2"
-  "eu-west-1   backend-3   t3.xlarge   4"
+  "us-east-1   backend-1   t3.small"
+  "us-west-2   backend-2   t3.medium"
+  "eu-west-1   backend-3   t3.xlarge"
 )
 
 get_latest_ami() {
@@ -61,9 +64,9 @@ ensure_sg() {
 }
 
 launch_instance() {
-  local region="$1" id="$2" instance_type="$3" docker_cpus="$4"
+  local region="$1" id="$2" instance_type="$3"
 
-  echo "━━━ [$region] Launching $id ($instance_type, ${docker_cpus} docker CPU(s)) ━━━"
+  echo "━━━ [$region] Launching $id ($instance_type) ━━━"
 
   local ami sg_id instance_id public_ip
   ami=$(get_latest_ami "$region")
@@ -75,10 +78,6 @@ launch_instance() {
   user_data=$(cat <<'EOF'
 #!/bin/bash
 dnf update -y
-dnf install -y docker
-systemctl enable docker
-systemctl start docker
-mkdir -p /opt/inteliLB
 EOF
 )
 
@@ -104,7 +103,7 @@ EOF
     --output text)
 
   echo "  $id UP at $public_ip"
-  echo "$public_ip $id $region $docker_cpus" >> "$STATE_FILE"
+  echo "$public_ip $id $region" >> "$STATE_FILE"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -112,17 +111,17 @@ EOF
 rm -f "$STATE_FILE"
 
 for entry in "${BACKENDS[@]}"; do
-  read -r region id instance_type docker_cpus <<< "$entry"
-  launch_instance "$region" "$id" "$instance_type" "$docker_cpus"
+  read -r region id instance_type <<< "$entry"
+  launch_instance "$region" "$id" "$instance_type"
 done
 
 echo ""
-echo "━━━ Waiting 40s for SSH + Docker to become available... ━━━"
+echo "━━━ Waiting 40s for SSH to become available... ━━━"
 sleep 40
 
-while IFS=' ' read -r ip id region docker_cpus; do
+while IFS=' ' read -r ip id region; do
   echo "Deploying $id on $ip ($region)..."
-  PUBLIC_IP="$ip" SSH_USER="ec2-user" REGION="$region" ID="$id" DOCKER_CPUS="$docker_cpus" \
+  PUBLIC_IP="$ip" SSH_USER="ec2-user" REGION="$region" ID="$id" \
     bash "$DIR/../deploy-backend.sh"
 done < "$STATE_FILE"
 
@@ -133,7 +132,7 @@ echo "All AWS backends deployed. Run the load balancer locally:"
 echo ""
 
 BACKEND_URLS=""
-while IFS=' ' read -r ip id region docker_cpus; do
+while IFS=' ' read -r ip id region; do
   BACKEND_URLS+="http://$ip:8080,"
 done < "$STATE_FILE"
 BACKEND_URLS="${BACKEND_URLS%,}"
@@ -143,8 +142,8 @@ echo "    -port=8080 \\"
 echo "    -algorithm=intelligent \\"
 echo "    -backends=\"$BACKEND_URLS\""
 echo ""
-echo "CPU layout:"
-while IFS=' ' read -r ip id region docker_cpus; do
-  printf "  %-12s  %-10s  %s core(s)  http://%s:8080\n" "$region" "$id" "$docker_cpus" "$ip"
+echo "Instance layout:"
+while IFS=' ' read -r ip id region; do
+  printf "  %-12s  %-10s  http://%s:8080\n" "$region" "$id" "$ip"
 done < "$STATE_FILE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
