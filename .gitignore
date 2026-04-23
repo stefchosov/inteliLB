@@ -1,8 +1,10 @@
 
-# experiment raw data — too large for git
+# experiment raw data — per-request CSVs are too large for git
 results/**/*.csv
-results/**/*.json
 results/**/*.log
+# but keep small per-algorithm summaries and utilization timeseries
+!results/**/*_utilization.csv
+!results/**/*_stats.json
 bin/
 backend
 client

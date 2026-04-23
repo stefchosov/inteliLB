@@ -332,6 +332,9 @@ for algo in "${SAT_ALGORITHMS[@]}"; do
     local_rate_idx=$((local_rate_idx + 1))
     log "  rate=$rate req/s [${local_rate_idx}/${#SAT_RATES[@]}]"
 
+    start_poller "$SAT_DIR/${algo}_rate${rate}_utilization.csv" &
+    POLLER_PID=$!
+
     "$PROJECT_ROOT/bin/client" \
       -url=http://localhost:8080 \
       -mode=open \
@@ -339,6 +342,8 @@ for algo in "${SAT_ALGORITHMS[@]}"; do
       -duration=60s \
       -intensity=1 \
       -output="$SAT_DIR/${algo}_rate${rate}.csv"
+
+    stop_poller
 
     curl -sf http://localhost:8080/lb/stats \
       > "$SAT_DIR/${algo}_rate${rate}_stats.json" 2>/dev/null \
