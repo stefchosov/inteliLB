@@ -1,0 +1,10 @@
+name:       io_bound
+workers:    100
+intensity:  5
+mix:        io:100
+duration:   90s
+algorithms: round_robin lowest_latency least_connections lowest_cpu intelligent adaptive
+date:       Thu Apr 23 07:26:24 PM UTC 2026
+b1:  westus2         D2s_v3  1-core (taskset)
+b2:  northcentralus  D2s_v3  2-core
+b3:  eastus2         D4s_v3  4-core

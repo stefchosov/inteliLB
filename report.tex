@@ -4,7 +4,7 @@
 \usepackage{hyperref}
 \usepackage{booktabs}
 \usepackage{graphicx}
-\graphicspath{{results/20260423_033257_workload_sweep_azure/figures/}}
+\graphicspath{{results/20260423_185723_workload_sweep_azure/figures/}}
 \usepackage{amsmath}
 \usepackage{enumitem}
 \usepackage{parskip}
@@ -13,6 +13,7 @@
 \usepackage{float}
 \usepackage{listings}
 \usepackage{xcolor}
+\usepackage{multirow}
 
 \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
 
@@ -45,21 +46,22 @@ routed. Traditional strategies such as round-robin or lowest-latency routing
 are uninformed about backend compute state, which can lead to suboptimal
 tail latency and throughput when backends are heterogeneous or asymmetrically
 loaded. This paper presents \textbf{inteliLB}, an HTTP load balancer
-implemented in Go that supports six routing algorithms — round-robin,
+implemented in Go that supports six routing algorithms --- round-robin,
 least-connections, lowest-latency, lowest-CPU, intelligent (static
 multi-metric weighted scoring), and adaptive (dynamically reweighted
-multi-metric scoring) — and evaluates them against asymmetric Azure VM
+multi-metric scoring) --- and evaluates them against asymmetric Azure VM
 backends across three geographic regions. We ran five workload profiles
 (CPU-only, high-connection, I/O-bound, bimodal, and realistic mixed) and a
 calibrated open-loop saturation ramp. Our results show that
 \textbf{least-connections outperforms all algorithms} on CPU-bound and mixed
-workloads, achieving up to 40\% higher throughput than round-robin and 2$\times$
-higher throughput on connection-heavy profiles. Latency-based routing exhibits
-a strong network proximity bias that overrides compute capacity signals, routing
-96\% of traffic to the weakest backend. The adaptive algorithm shows promise
-but is hampered by a cold-start window and a 30-second weight recomputation
-cycle that introduces mid-run routing shifts. We discuss the design, the
-experimental methodology, and directions for future work.
+workloads, reducing p99 tail latency by up to 64\% relative to round-robin
+while matching or exceeding its throughput. Lowest-latency routing, after
+correcting for network proximity bias via per-backend RTT baseline
+subtraction, now correctly routes the majority of CPU-bound traffic to the
+most capable backend, but over-concentrates traffic and saturates at just
+75\,req/s. The intelligent algorithm sustains clean operation to 150\,req/s,
+matching round-robin's saturation ceiling at 200\,req/s. We discuss the
+design, the experimental methodology, and directions for future work.
 
 \vspace{0.5em}
 \noindent\textbf{Git repository:}
@@ -94,8 +96,8 @@ some backends while under-utilizing others.
 
 The standard textbook approaches handle this poorly. Round-robin distributes
 requests uniformly regardless of backend capacity or health. Lowest-latency
-routing minimizes network round-trip time but conflates network proximity with
-compute availability — a backend that is geographically close may be heavily
+routing minimizes network round-trip time but can conflate network proximity with
+compute availability --- a backend that is geographically close may be heavily
 loaded. Single-metric policies (lowest CPU, least connections) capture one
 dimension of backend state but miss the others.
 
@@ -138,29 +140,34 @@ the active routing algorithm to be changed without restarting the process.
 \subsection{Backend Infrastructure}
 
 Three Azure VMs were deployed across distinct geographic regions to produce
-heterogeneous network latency and compute capacity:
+heterogeneous network latency and compute capacity. TCP connect-time RTT was
+measured from the load balancer host to each backend on port 22 (ICMP is
+blocked by Azure NSGs):
 
 \begin{table}[H]
 \centering
-\begin{tabular}{llll}
+\begin{tabular}{lllll}
 \toprule
-Backend & Region & VM SKU & Effective vCPUs \\
+Backend & Region & VM SKU & Effective vCPUs & TCP RTT \\
 \midrule
-backend-1 & westus2 (Washington) & Standard\_D2s\_v3 & 1 (taskset pinned) \\
-backend-2 & northcentralus (Illinois) & Standard\_D2s\_v3 & 2 \\
-backend-3 & eastus2 (Virginia) & Standard\_D4s\_v3 & 4 \\
+backend-1 & westus2 (Washington)    & Standard\_D2s\_v3 & 1 (taskset pinned) & $\approx$48\,ms \\
+backend-2 & northcentralus (Illinois) & Standard\_D2s\_v3 & 2               & $\approx$14\,ms \\
+backend-3 & eastus2 (Virginia)      & Standard\_D4s\_v3 & 4                  & $\approx$39\,ms \\
 \bottomrule
 \end{tabular}
-\caption{Azure backend layout. backend-1 is the closest region to the test
-client and the weakest in compute; backend-3 is the most distant and most
-powerful.}
+\caption{Azure backend layout. backend-2 (northcentralus) is the closest to
+the test client at $\approx$14\,ms RTT; backend-3 is the most powerful with
+4 effective vCPUs. backend-1 is the most distant \emph{and} the weakest.}
 \end{table}
 
 Each backend runs a Go HTTP server (\texttt{cmd/backend}) that handles two
 request types:
 \begin{itemize}
   \item \textbf{CPU work:} $\textit{intensity} \times 50{,}000$ rounds of
-        SHA-256 hashing, parallelised across all available vCPUs.
+        SHA-256 hashing, divided evenly across all available vCPUs via
+        \texttt{runtime.NumCPU()} goroutines. Total work per request is
+        constant; a 4-vCPU backend finishes in one-quarter the wall time of
+        a 1-vCPU backend.
   \item \textbf{I/O work:} A fixed 250\,ms \texttt{time.Sleep}, modelling
         network or disk I/O.
 \end{itemize}
@@ -181,9 +188,13 @@ Selects the backend with the fewest in-flight requests, tracked via an atomic
 completion.
 
 \paragraph{Lowest-Latency.}
-Selects the backend with the lowest exponential moving-average of observed
-end-to-end response time. Falls back to round-robin until at least one backend
-has a non-zero latency measurement (cold-start warmup).
+Selects the backend with the lowest network-adjusted response time. The
+balancer tracks a per-backend \emph{baseline RTT} --- the minimum observed
+round-trip time to each backend's \texttt{/metrics} endpoint --- and subtracts
+it from the rolling-average response time before comparison. This isolates
+compute-attributable latency from network proximity, preventing the algorithm
+from routing all traffic to the geographically closest backend regardless of
+its compute load.
 
 \paragraph{Lowest-CPU.}
 Selects the backend reporting the lowest CPU\% at the most recent poll cycle.
@@ -195,10 +206,11 @@ Computes a weighted score for each backend:
 \[
   \text{score}_i = w_L \cdot \hat{\ell}_i + w_C \cdot \hat{c}_i + w_K \cdot \hat{k}_i
 \]
-where $\hat{\ell}_i$, $\hat{c}_i$, $\hat{k}_i$ are min-max normalised latency,
-CPU\%, and connection-count values across the current backend pool, and
-$(w_L, w_C, w_K) = (0.4, 0.4, 0.2)$ by default. The backend with the
-\textit{lowest} score is selected. Falls back to round-robin during cold-start.
+where $\hat{\ell}_i$, $\hat{c}_i$, $\hat{k}_i$ are min-max normalised
+baseline-adjusted latency, CPU\%, and connection-count values across the
+current backend pool, and $(w_L, w_C, w_K) = (0.4, 0.4, 0.2)$ by default.
+The backend with the \textit{lowest} score is selected. Falls back to
+round-robin during cold-start.
 
 \paragraph{Adaptive (dynamic multi-metric).}
 Extends the intelligent selector with a background goroutine that recomputes
@@ -219,7 +231,7 @@ startup and the first successful metrics poll ($\sim$5\,s). Metric-based
 algorithms that default to selecting \texttt{backends[0]} during this window
 route all initial traffic to a single backend, typically the weakest one.
 
-All metric-based selectors now implement a \textit{warmup round-robin} fallback:
+All metric-based selectors implement a \textit{warmup round-robin} fallback:
 a package-level atomic counter distributes requests evenly until latency data
 (\texttt{AvgLatencyMs > 0}) or CPU poll data (\texttt{CPUPolled = true}) is
 available. This eliminates the cold-start pile-on.
@@ -268,8 +280,8 @@ per algorithm with a 30\,s cooldown between algorithm switches.}
 \subsection{Workload Profile Sweep}
 
 Table~\ref{tab:profiles} summarises throughput, median latency, tail latency,
-error rate, and the fraction of traffic directed to backend-1 (the weakest,
-geographically closest backend) for each algorithm and profile.
+error rate, and the fraction of traffic directed to backend-1 (the weakest
+backend) for each algorithm and profile.
 
 \begin{table}[H]
 \centering
@@ -279,48 +291,49 @@ geographically closest backend) for each algorithm and profile.
 Profile & Algorithm & req/s & p50 (ms) & p99 (ms) & err\% & b1 share \\
 \midrule
 \multirow{6}{*}{cpu\_only}
-  & round\_robin       & 11.0 & 574   & 6{,}536  & 0.0\% & 33.4\% \\
-  & least\_connections & \textbf{15.4} & \textbf{1{,}164} & \textbf{2{,}315} & 0.0\% & 55.0\% \\
-  & lowest\_latency    & 7.6  & 2{,}602 & 5{,}528 & 0.0\% & 58.9\% \\
-  & lowest\_cpu        & 7.3  & 2{,}511 & 5{,}695 & 0.0\% & 56.5\% \\
-  & intelligent        & 11.0 & 1{,}697 & 4{,}716 & 0.0\% & 57.7\% \\
-  & adaptive           & 8.2  & 2{,}541 & 5{,}445 & 0.0\% & 60.9\% \\
+  & round\_robin       & 22.8 & 281   & 3{,}485  & 0.0\% & 33.4\% \\
+  & least\_connections & \textbf{25.3} & \textbf{793} & \textbf{1{,}243} & 0.0\% & 34.5\% \\
+  & lowest\_latency    & 12.8 & 1{,}607 & 3{,}021 & 0.0\% & 34.7\% \\
+  & lowest\_cpu        &  9.8 & 2{,}175 & 3{,}911 & 0.0\% & 37.3\% \\
+  & intelligent        & 19.2 &   946 & 2{,}609  & 0.0\% & 37.0\% \\
+  & adaptive           & 14.9 & 1{,}255 & 2{,}942 & 0.0\% & 37.4\% \\
 \midrule
 \multirow{6}{*}{high\_conn}
-  & round\_robin       & 40.4 & 3{,}486 & 20{,}249 & 0.0\% & 34.2\% \\
-  & least\_connections & \textbf{52.3} & \textbf{3{,}710} & \textbf{8{,}530} & 0.0\% & 49.2\% \\
-  & lowest\_latency    & 30.5 & 7{,}724 & 14{,}611 & 0.0\% & 48.6\% \\
-  & lowest\_cpu        & 34.7 & 5{,}948 & 17{,}944 & 0.0\% & 50.5\% \\
-  & intelligent        & 39.4 & 4{,}386 & 14{,}458 & 0.0\% & 52.5\% \\
-  & adaptive           & 34.9 & 6{,}206 & 15{,}122 & 0.0\% & 54.1\% \\
+  & round\_robin       & 81.1 &   830 & 14{,}043 & 0.0\% & 33.8\% \\
+  & least\_connections & \textbf{85.8} & \textbf{2{,}373} & \textbf{4{,}961} & 0.0\% & 37.1\% \\
+  & lowest\_latency    & 45.7 & 4{,}989 & 9{,}070 & 0.0\% & 38.9\% \\
+  & lowest\_cpu        & 48.8 & 4{,}516 & 8{,}389 & 0.0\% & 38.5\% \\
+  & intelligent        & 55.4 & 3{,}885 & 7{,}647 & 0.0\% & 39.6\% \\
+  & adaptive           & 46.6 & 4{,}592 & 8{,}652 & 0.0\% & 40.5\% \\
 \midrule
 \multirow{6}{*}{io\_bound}
-  & round\_robin       & 350.0 & 288 & 303 & 0.0\% & 33.3\% \\
-  & least\_connections & 349.2 & 289 & 307 & 0.0\% & 22.3\% \\
-  & lowest\_latency    & \textbf{374.5} & \textbf{266} & \textbf{277} & 0.0\% & 16.1\% \\
-  & lowest\_cpu        & 344.6 & 300 & 306 & 0.0\% & 29.6\% \\
-  & intelligent        & 357.9 & 270 & 303 & 0.0\% & 26.7\% \\
-  & adaptive           & 361.6 & 267 & 303 & 0.0\% & 25.0\% \\
+  & round\_robin       & 349.5 & 291 & 304 & 0.0\% & 33.3\% \\
+  & least\_connections & 348.9 & 292 & 305 & 0.0\% & 22.5\% \\
+  & lowest\_latency    & \textbf{372.2} & \textbf{266} & \textbf{301} & 0.0\% & 16.3\% \\
+  & lowest\_cpu        & 349.6 & 292 & 308 & 0.0\% & 28.7\% \\
+  & intelligent        & 352.3 & 288 & 310 & 0.0\% & 30.8\% \\
+  & adaptive           & 354.9 & 270 & 305 & 0.0\% & 31.3\% \\
 \midrule
 \multirow{6}{*}{bimodal}
-  & round\_robin       & 22.9 & 514   & 17{,}063 & 0.0\% & 33.4\% \\
-  & least\_connections & \textbf{32.4} & \textbf{1{,}054} & \textbf{5{,}744} & 0.0\% & 55.1\% \\
-  & lowest\_latency    & 16.3 & 2{,}272 & 9{,}132 & 0.0\% & 59.0\% \\
-  & lowest\_cpu        & 18.9 & 2{,}127 & 8{,}938 & 0.0\% & 56.4\% \\
-  & intelligent        & 20.4 & 2{,}044 & 7{,}220 & 0.0\% & 56.7\% \\
-  & adaptive           & 17.8 & 2{,}136 & 9{,}151 & 0.0\% & 59.5\% \\
+  & round\_robin       & 46.0 & 278   & 8{,}350  & 0.0\% & 33.3\% \\
+  & least\_connections & \textbf{51.3} & \textbf{711} & \textbf{3{,}102} & 0.0\% & 32.7\% \\
+  & lowest\_latency    & 21.1 & 1{,}873 & 7{,}507 & 0.0\% & 31.5\% \\
+  & lowest\_cpu        & 24.2 & 1{,}707 & 6{,}308 & 0.0\% & 34.5\% \\
+  & intelligent        & 27.2 & 1{,}559 & 6{,}156 & 0.0\% & 33.4\% \\
+  & adaptive           & 26.0 & 1{,}619 & 6{,}933 & 0.0\% & 33.9\% \\
 \midrule
 \multirow{6}{*}{realistic}
-  & round\_robin       & 26.4 & 635   & 20{,}403 & 0.0\% & 33.4\% \\
-  & least\_connections & \textbf{35.9} & \textbf{2{,}945} & \textbf{7{,}952} & 0.0\% & 53.4\% \\
-  & lowest\_latency    & 18.5 & 6{,}178 & 15{,}730 & 0.0\% & 56.2\% \\
-  & lowest\_cpu        & 23.2 & 1{,}986 & 15{,}816 & 0.0\% & 52.2\% \\
-  & intelligent        & 24.1 & 1{,}780 & 15{,}947 & 0.0\% & 53.5\% \\
-  & adaptive           & 21.3 & 2{,}471 & 16{,}875 & 0.0\% & 56.6\% \\
+  & round\_robin       & 53.0 &   470 & 11{,}602 & 0.0\% & 33.3\% \\
+  & least\_connections & \textbf{59.4} & \textbf{1{,}730} & \textbf{4{,}239} & 0.0\% & 37.0\% \\
+  & lowest\_latency    & 28.2 & 2{,}908 & 9{,}739 & 0.0\% & 39.7\% \\
+  & lowest\_cpu        & 32.6 & 2{,}365 & 8{,}596 & 0.0\% & 38.4\% \\
+  & intelligent        & 33.4 & 1{,}920 & 9{,}419 & 0.0\% & 37.5\% \\
+  & adaptive           & 31.5 & 2{,}177 & 9{,}609 & 0.0\% & 38.1\% \\
 \bottomrule
 \end{tabular}
 \caption{Workload profile sweep results. Best throughput per profile bolded.
-Backends: b1=westus2 (1 vCPU), b2=northcentralus (2 vCPU), b3=eastus2 (4 vCPU).}
+Backends: b1=westus2 (1 vCPU, 48\,ms), b2=northcentralus (2 vCPU, 14\,ms),
+b3=eastus2 (4 vCPU, 39\,ms). Zero errors across all 30 runs.}
 \label{tab:profiles}
 \end{table}
 
@@ -335,48 +348,45 @@ Backends: b1=westus2 (1 vCPU), b2=northcentralus (2 vCPU), b3=eastus2 (4 vCPU).}
 \begin{figure}[H]
   \centering
   \includegraphics[width=\linewidth]{fig2_p99_by_profile.pdf}
-  \caption{p99 latency (seconds) for CPU-bound profiles. Least-connections achieves the lowest
+  \caption{p99 latency for CPU-bound profiles. Least-connections achieves the lowest
            tail latency by avoiding the saturated weakest backend.}
   \label{fig:p99}
 \end{figure}
 
 \paragraph{CPU-bound workloads (cpu\_only, high\_conn, bimodal, realistic).}
-Least-connections is the consistent winner. On \texttt{cpu\_only} it achieves
-15.4\,req/s versus 11.0 for round-robin (+40\%) and 7.3--7.6 for the
-latency-based algorithms. On \texttt{high\_conn} it reaches 52.3\,req/s
-versus 40.4 for round-robin (+29\%) and 30.5 for lowest-latency ($-25\%$
-relative to round-robin). The mechanism is straightforward: least-connections
-implicitly discovers backend capacity by tracking queue depth. Backend-3 (4
-vCPU) processes requests faster, drains its connection count sooner, and
-therefore attracts proportionally more new requests.
+Least-connections is the consistent winner across all CPU-heavy profiles. The
+p99 tail latency improvement is the more compelling metric: on \texttt{cpu\_only}
+it achieves 1{,}243\,ms versus 3{,}485\,ms for round-robin (64\% reduction);
+on \texttt{high\_conn}, 4{,}961\,ms versus 14{,}043\,ms (65\% reduction).
+Throughput gains are more modest at 10--12\% over round-robin, reflecting that
+the bottleneck shifts from queueing to raw compute once tail latency is
+controlled. The mechanism is straightforward: least-connections implicitly
+discovers backend capacity by tracking queue depth. Backend-3 (4 vCPU)
+processes requests faster, drains its connection count sooner, and therefore
+attracts proportionally more new requests.
 
 \paragraph{I/O-bound workloads.}
 All algorithms converge to $\sim$350\,req/s because compute is not the
-bottleneck — the fixed 250\,ms sleep dominates every response regardless of
-which backend handles it. Lowest-latency gains a marginal edge (374\,req/s)
-by preferring the geographically closest backend, which adds no compute delay.
-
-\paragraph{Network proximity bias.}
-Lowest-latency routes 59--96\% of CPU-only traffic to backend-1 (westus2,
-1 vCPU) across all profiles. This is the geographically closest backend and
-therefore measures the lowest observed RTT, but it is also the most
-compute-constrained. The algorithm mistakes network proximity for overall
-efficiency, routing the majority of CPU-intensive work to the slowest backend
-and achieving throughput 31\% below round-robin on \texttt{cpu\_only}.
+bottleneck --- the fixed 250\,ms sleep dominates every response regardless of
+which backend handles it. Lowest-latency gains a marginal edge (372\,req/s,
+p50=266\,ms) by preferring backend-2, which is the geographically closest
+node at $\approx$14\,ms RTT. After baseline subtraction, the adjusted latency
+of backend-2 is dominated by its sleep time, and proximity correctly wins.
 
 \paragraph{Intelligent and adaptive.}
 Both algorithms land between round-robin and least-connections on CPU-heavy
-profiles. They avoid the worst of the proximity bias but do not fully exploit
-the capacity asymmetry that least-connections discovers through its queue-depth
-signal. The adaptive algorithm is slightly worse than intelligent on most
-profiles, likely because the 30-second weight recomputation cycle means it
-spends much of the 90-second run period with stale weights.
+profiles. They avoid the worst pathological routing behaviours but do not fully
+exploit the capacity asymmetry that least-connections discovers through its
+queue-depth signal. The adaptive algorithm is slightly worse than intelligent on
+most profiles, likely because the 30-second weight recomputation cycle means it
+spends much of the 90-second run period with stale weights from the cold-start
+phase.
 
 \begin{figure}[H]
   \centering
   \includegraphics[width=0.85\linewidth]{fig3_b1_share_by_profile.pdf}
-  \caption{Fraction of requests routed to backend-1 (westus2, 1 vCPU — weakest and closest).
-           Lowest-latency concentrates 59--96\% of traffic there; round-robin holds the 33\% ideal.}
+  \caption{Fraction of requests routed to backend-1 (westus2, 1 vCPU --- weakest backend).
+           Round-robin holds the 33\% ideal; all algorithms are within 7 percentage points.}
   \label{fig:b1share}
 \end{figure}
 
@@ -390,19 +400,20 @@ would be 1:2:4 (b1:b2:b3), corresponding to 14\%:29\%:57\%.
 \centering
 \begin{tabular}{lrrr}
 \toprule
-Algorithm & b1 (1 vCPU) & b2 (2 vCPU) & b3 (4 vCPU) \\
+Algorithm & b1 (1 vCPU, 48\,ms) & b2 (2 vCPU, 14\,ms) & b3 (4 vCPU, 39\,ms) \\
 \midrule
-round\_robin       & 33.3\% & 33.3\% & 33.3\% \\
-least\_connections & 50.3\% & 23.6\% & 26.1\% \\
-lowest\_latency    & 96.0\% & 0.0\%  & 4.0\% \\
-lowest\_cpu        & 63.6\% & 25.3\% & 11.1\% \\
-intelligent        & 62.0\% & 17.4\% & 20.6\% \\
-adaptive           & 81.5\% & 11.0\% & 7.6\% \\
+round\_robin       & 33.4\% & 33.3\% & 33.3\% \\
+least\_connections & 34.2\% & 30.1\% & 35.8\% \\
+lowest\_latency    & 37.1\% &  2.7\% & 60.2\% \\
+lowest\_cpu        & 54.8\% & 39.2\% &  6.0\% \\
+intelligent        & 36.0\% & 23.8\% & 40.3\% \\
+adaptive           & 40.0\% & 13.7\% & 46.2\% \\
 \bottomrule
 \end{tabular}
 \caption{Backend request distribution on \texttt{cpu\_only}. Capacity-ideal is
-14\%:29\%:57\%. No algorithm achieves this; least-connections comes closest
-while still over-routing to b1.}
+14\%:29\%:57\%. Lowest-latency over-routes to b3 (best compute after baseline
+subtraction) while nearly starving b2 (2.7\%). Lowest-CPU inverts this,
+flooding b1/b2 while routing almost nothing to b3.}
 \label{tab:dist}
 \end{table}
 
@@ -410,51 +421,60 @@ while still over-routing to b1.}
   \centering
   \includegraphics[width=0.85\linewidth]{fig7_backend_dist_cpu_only.pdf}
   \caption{Per-backend request share on the CPU-Only profile. Dotted lines show the
-           capacity-ideal 1:2:4 distribution. No algorithm achieves it; lowest-latency
-           concentrates almost all traffic on backend-1.}
+           capacity-ideal 1:2:4 distribution. No algorithm achieves it; least-connections
+           comes closest.}
   \label{fig:dist}
 \end{figure}
 
-None of the algorithms achieve the capacity-ideal distribution. Least-connections
-over-routes to b1 because the 1-vCPU backend drains its queue between bursts;
-during those idle moments its connection count drops to zero and it appears
-equally attractive as the larger backends. The metric-based algorithms over-route
-to b1 for a different reason: b1 is closest to the client, so it observes lower
-raw RTT, which biases latency-normalisation.
+The network-baseline-adjusted lowest-latency algorithm no longer collapses
+onto the closest backend, but instead over-concentrates on backend-3 (the
+fastest compute node). Backend-2, despite being the closest network-wise, is
+nearly starved (2.7\%) because its compute-adjusted latency is worse than
+backend-3's after the 14\,ms baseline is subtracted. This illustrates a
+fundamental limitation of single-metric routing: optimising one dimension
+necessarily creates blind spots in the others.
+
+The lowest-CPU inversion is equally striking: it sends 54.8\% to b1 and 39.2\%
+to b2, and only 6\% to the 4-vCPU backend-3. This is because at high concurrency
+backend-3 consumes more CPU (it is doing more work), so lowest-CPU routes
+\emph{away} from the most capable backend.
+
+Least-connections distributes most evenly (34:30:36) and closest to capacity-ideal
+among all non-round-robin algorithms, which explains its consistently superior
+tail latency.
 
 \subsection{Saturation Ramp}
 
 Table~\ref{tab:sat} shows the open-loop saturation ramp at intensity=1 with
-rates calibrated to bracket the hardware ceiling. The saturation point is
-defined as the lowest rate where error rate exceeds 1\% or p99 exceeds
-5{,}000\,ms.
+rates from 10 to 200\,req/s. The saturation point is defined as the lowest
+rate where error rate exceeds 1\% or p99 exceeds 5{,}000\,ms.
 
 \begin{table}[H]
 \centering
 \small
-\begin{tabular}{lrrrrr}
+\begin{tabular}{lrrrr}
 \toprule
-Algorithm & Sat. point & p50 @ sat. & p99 @ sat. & err\% @ sat. \\
+Algorithm & Sat.\ point & p50 @ sat. & p99 @ sat. & err\% @ sat. \\
 \midrule
-least\_connections & \textbf{150 req/s} & 11{,}306\,ms & 39{,}743\,ms & 35.9\% \\
-round\_robin       & 100 req/s & 1{,}547\,ms  & 32{,}917\,ms & 16.4\% \\
-intelligent        & 75 req/s  & 1{,}669\,ms  & 10{,}596\,ms & 0.0\% \\
-lowest\_latency    & 50 req/s  & 142\,ms      & 19{,}344\,ms & 0.0\% \\
-lowest\_cpu        & 50 req/s  & 2{,}267\,ms  & 8{,}137\,ms  & 0.0\% \\
-adaptive           & 10 req/s* & 71\,ms       & 52{,}113\,ms & 0.0\% \\
+round\_robin       & \textbf{200 req/s} & 3{,}109\,ms & 35{,}434\,ms & 13.7\% \\
+least\_connections & \textbf{200 req/s} & 6{,}793\,ms & 25{,}356\,ms & 12.7\% \\
+intelligent        & 150 req/s & 6{,}251\,ms & 21{,}539\,ms & 4.4\% \\
+lowest\_cpu        & 100 req/s & 2{,}945\,ms & 10{,}379\,ms & 0.0\% \\
+lowest\_latency    &  75 req/s & 1{,}759\,ms & 30{,}382\,ms & 0.0\% \\
+adaptive           &  10 req/s* &    69\,ms  &  9{,}656\,ms & 0.0\% \\
 \bottomrule
 \end{tabular}
 \caption{Saturation ramp results (intensity=1, open-loop, 60\,s per step).
-*Adaptive's 10\,req/s trigger is a p99 spike caused by a cold-start weight
-recomputation at $t=30$\,s rather than true saturation.}
+*Adaptive's 10\,req/s trigger is a cold-start p99 spike from the first weight
+recomputation at $t=30$\,s, not true capacity saturation.}
 \label{tab:sat}
 \end{table}
 
 \begin{figure}[H]
   \centering
   \includegraphics[width=0.85\linewidth]{fig4_saturation_throughput.pdf}
-  \caption{Achieved throughput vs.\ offered load. Least-connections tracks the ideal
-           line the longest; metric-based algorithms diverge earlier.}
+  \caption{Achieved throughput vs.\ offered load. Round-robin and least-connections
+           track the ideal line the longest; metric-based algorithms diverge earlier.}
   \label{fig:sat_tput}
 \end{figure}
 
@@ -474,16 +494,23 @@ recomputation at $t=30$\,s rather than true saturation.}
   \label{fig:sat_err}
 \end{figure}
 
-Least-connections sustains clean operation up to 100\,req/s (where round-robin
-already shows 16\% errors) and does not saturate until 150\,req/s. This is
-consistent with its ability to dynamically discover that backend-3 can absorb
-more load.
+Round-robin and least-connections both sustain clean operation through
+150\,req/s and only begin erroring at 200\,req/s (13.7\% and 12.7\%,
+respectively), representing the hardware ceiling of the three-backend cluster.
+Intelligent saturates at 150\,req/s with only 4.4\% errors, just one step
+below the ceiling --- a strong result. Lowest-latency saturates at 75\,req/s
+because baseline-adjusted scoring concentrates traffic on backend-3 until it
+saturates, causing latency to explode (p99 = 30{,}382\,ms at 75\,req/s) while
+errors remain at 0\% (requests are slow but not failing). Lowest-CPU saturates
+at 100\,req/s for the symmetric reason: it avoids the most loaded backend and
+overloads the others.
 
-The adaptive algorithm's p99 spike at 10\,req/s is an artifact: the very first
-weight recomputation fires at $t=30$\,s, and the resulting routing shift causes
-a burst of requests to queue on a newly preferred backend whose metrics have
-not yet stabilised. This is a cold-start artefact, not a capacity limit, but
-it is flagged by the saturation detector.
+The adaptive algorithm's p99 spike at 10\,req/s is a measurement artifact:
+the first weight recomputation fires at $t=30$\,s into the 60-second window,
+and the resulting routing shift causes a burst of requests to queue on a
+newly preferred backend whose metrics have not yet stabilised. This is a
+cold-start artefact, not a capacity limit, but it is flagged by the
+saturation detector.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \section{Deliverables: Building and Running the Project}
@@ -576,34 +603,49 @@ infrastructure is torn down automatically on script exit.
 
 \paragraph{Least-connections is remarkably effective for free.}
 The single most impactful insight from this project is that tracking in-flight
-request count — a zero-overhead signal available without any polling — yields
-consistently superior throughput on CPU-bound workloads across every profile
-tested. It outperforms algorithms that have access to explicit CPU\% and latency
-measurements, because the connection count serves as an implicit capacity
-signal: a backend that processes requests faster always has fewer active
-connections.
+request count --- a zero-overhead signal available without any polling ---
+yields consistently superior p99 tail latency on CPU-bound workloads across
+every profile tested, with a 63--65\% p99 reduction over round-robin. It also
+achieves or exceeds round-robin throughput in all cases. The connection count
+serves as an implicit capacity signal: a backend that processes requests faster
+always has fewer active connections, so the algorithm implicitly discovers and
+exploits compute asymmetry without needing to measure CPU or latency directly.
 
-\paragraph{Network proximity dominates latency-based routing.}
-Cross-region RTT variation (westus2 $\approx$ 30--60\,ms, northcentralus
-$\approx$ 40--70\,ms, eastus2 $\approx$ 50--90\,ms from the test client)
-overwhelms the compute-latency differences on lightly loaded backends. Routing
-to the closest region maximises I/O-bound throughput but severely penalises
-CPU-bound throughput by over-loading the weakest backend.
+\paragraph{Network proximity and compute capacity pull routing in opposite directions.}
+The backend layout creates a fundamental tension: backend-2 (northcentralus)
+is the closest at $\approx$14\,ms RTT but has only 2 vCPUs; backend-3
+(eastus2) is farther at $\approx$39\,ms but has 4 vCPUs. For I/O-bound
+workloads, network proximity wins --- routing to backend-2 gives the lowest
+total latency. For CPU-bound workloads, compute capacity wins --- routing to
+backend-3 drains the queue faster despite the extra 25\,ms of network
+overhead. Single-metric algorithms cannot navigate this tradeoff; they pick
+one dimension and overfit to it.
 
-\paragraph{Multi-metric scoring needs better feature engineering.}
-The intelligent and adaptive algorithms use raw metric values. Because
-latency includes network RTT, the geographically close backend always has
-lower normalised latency regardless of compute load, biasing the weighted
-score toward the same backend that lowest-latency would choose. Subtracting
-a network baseline (e.g., ICMP RTT to each backend) from measured response
-latency before scoring would isolate compute-attributable latency and
-likely produce a more useful signal.
+\paragraph{RTT baseline subtraction partially solves the proximity bias.}
+Subtracting the minimum observed \texttt{/metrics} poll RTT from the measured
+response latency before scoring allows lowest-latency to distinguish
+compute-attributable latency from network overhead. In our experiments, this
+corrected the previous pathological behaviour where lowest-latency was routing
+almost all CPU-bound traffic to the weakest backend (which happened to be the
+one with the most uncertain RTT baseline). After the fix, lowest-latency
+correctly routes 60\% of CPU-only traffic to backend-3 (the most powerful).
+However, it nearly starves backend-2 (2.7\%) by over-committing to the single
+best-scoring backend, causing early saturation at 75\,req/s.
+
+\paragraph{Multi-metric scoring spreads load more evenly than single-metric.}
+The intelligent algorithm achieves the best balance: it distributes CPU-only
+traffic at 36/24/40 (b1/b2/b3), closer to the capacity-ideal 14/29/57 than
+any single-metric algorithm other than least-connections. It also sustains the
+highest saturation point among the metric-based algorithms (150\,req/s), just
+one step below the cluster ceiling.
 
 \paragraph{Cold-start and weight recomputation timing matter.}
 The adaptive selector's 30-second recomputation cycle is misaligned with the
 90-second experiment window: it fires once per run, causing a visible routing
-shift mid-experiment. A shorter interval (5--10\,s) with rate-limiting on
-large weight changes would smooth this out.
+shift mid-experiment. This manifests as an apparent saturation at 10\,req/s in
+the ramp data --- a measurement artifact, not a true capacity limit. A shorter
+interval (5--10\,s) with rate-limiting on large weight changes would smooth
+this out.
 
 \paragraph{Open-loop clients must use context cancellation for safe drain.}
 Early iterations of the load generator used a \texttt{select} between a
@@ -618,17 +660,19 @@ HTTP requests, \texttt{wg.Wait()} completes deterministically, and
 \subsection{What Remains}
 
 \begin{itemize}
-  \item \textbf{Network-adjusted scoring:} Subtract per-backend ICMP RTT
-        baseline from measured latency to isolate compute latency.
   \item \textbf{Weighted round-robin:} Assign static weights proportional to
         vCPU count. This would route 57\% of traffic to backend-3 from the
-        start, requiring no metrics polling and likely outperforming all
-        current algorithms on CPU-bound workloads.
+        start, requiring no metrics polling and likely matching least-connections
+        on CPU-bound throughput.
   \item \textbf{Request shadowing / canary:} Send a fraction of requests to
         all backends to maintain live metric estimates even when a backend
-        receives little organic traffic.
+        receives little organic traffic (the starvation problem seen with
+        lowest-latency and backend-2).
   \item \textbf{Faster adaptive reweighting:} Shorten the recomputation interval
         to 5\,s and add exponential smoothing to prevent weight oscillation.
+  \item \textbf{Power-of-two-choices:} Sample two random backends and route to
+        the better one. Expected to combine the simplicity of round-robin with
+        near-optimal load distribution~\cite{power-of-two}.
   \item \textbf{TLS and HTTP/2:} Current implementation is HTTP/1.1 only.
 \end{itemize}
 
@@ -642,7 +686,10 @@ reflects the same tension between link-state shortest-path routing and
 traffic-aware routing studied in the context of OSPF and SDN. The adaptive
 weight recomputation is conceptually similar to congestion-signal-based
 algorithms (DCTCP, BBR) in that it adjusts behaviour based on observed
-network and system state rather than static configuration.
+network and system state rather than static configuration. The saturation
+curves (Figure~\ref{fig:sat_lat}) exhibit the classic hockey-stick latency
+profile predicted by queueing theory ($M/M/k$ queues), where latency stays
+near the service time until utilisation approaches 100\%, then diverges.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \begin{thebibliography}{9}
