@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,7 +20,57 @@ import (
 
 var (
 	activeConns int64
+
+	// cpuCache holds the most recently sampled CPU utilization, normalised to
+	// the process's allocated core count so taskset-pinned backends report
+	// 100% when their single allowed core is saturated, not 50%.
+	cpuCacheMu    sync.RWMutex
+	cpuCacheValue float64
 )
+
+// startCPUSampler launches a background goroutine that samples system CPU
+// every 500 ms and caches the result. Returning instantly from /metrics
+// ensures the LB's BaselineRTTMs converges to true network RTT rather than
+// being inflated by the 200 ms blocking sample window.
+func startCPUSampler() {
+	totalCores, err := cpu.Counts(true)
+	if err != nil || totalCores < 1 {
+		totalCores = runtime.NumCPU()
+	}
+	allocatedCores := runtime.NumCPU()
+	// ratio > 1 when taskset limits the process to fewer cores than the VM has.
+	ratio := float64(totalCores) / float64(allocatedCores)
+
+	go func() {
+		for {
+			pcts, err := cpu.Percent(500*time.Millisecond, false)
+			if err == nil && len(pcts) > 0 {
+				scaled := pcts[0] * ratio
+				if scaled > 100 {
+					scaled = 100
+				}
+				cpuCacheMu.Lock()
+				cpuCacheValue = scaled
+				cpuCacheMu.Unlock()
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+	}()
+}
+
+func getCPU() float64 {
+	cpuCacheMu.RLock()
+	defer cpuCacheMu.RUnlock()
+	return cpuCacheValue
+}
+
+func getMemory() float64 {
+	v, err := mem.VirtualMemory()
+	if err != nil {
+		return 0
+	}
+	return v.UsedPercent
+}
 
 func main() {
 	port      := flag.Int("port", 8080, "listen port")
@@ -33,7 +84,6 @@ func main() {
 		runtime.GOMAXPROCS(*maxProcs)
 	}
 
-	// Allow env var overrides
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			*port = n
@@ -56,6 +106,8 @@ func main() {
 		}
 	}
 
+	startCPUSampler()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +120,7 @@ func main() {
 	})
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		cpuPct := getCPU()
+		cpuPct := getCPU()  // non-blocking — reads cached value
 		memPct := getMemory()
 		conns := atomic.LoadInt64(&activeConns)
 
@@ -107,7 +159,6 @@ func main() {
 			workType = v
 		}
 
-		// Default io_ms = intensity * 50; override with ?io_ms=N
 		ioMs := intensity * 50
 		if v := q.Get("io_ms"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {
@@ -135,34 +186,18 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result":        hash,
-			"duration_ms":   durationMs,
-			"work_type":     workType,
-			"io_ms_actual":  ioMsActual,
-			"region":        *region,
-			"id":            *id,
+			"result":       hash,
+			"duration_ms":  durationMs,
+			"work_type":    workType,
+			"io_ms_actual": ioMsActual,
+			"region":       *region,
+			"id":           *id,
 		})
 	})
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("backend %s (%s) listening on %s", *id, *region, addr)
+	log.Printf("backend %s (%s) listening on %s [cpus=%d]", *id, *region, addr, runtime.NumCPU())
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
 	}
-}
-
-func getCPU() float64 {
-	pcts, err := cpu.Percent(200*time.Millisecond, false)
-	if err != nil || len(pcts) == 0 {
-		return 0
-	}
-	return pcts[0]
-}
-
-func getMemory() float64 {
-	v, err := mem.VirtualMemory()
-	if err != nil {
-		return 0
-	}
-	return v.UsedPercent
 }

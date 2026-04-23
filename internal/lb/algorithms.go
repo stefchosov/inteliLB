@@ -44,6 +44,19 @@ type Selector interface {
 	Name() string
 }
 
+// preferLowerRTT returns true if b has a lower (better) network baseline than
+// current. Used as a tiebreaker when primary metrics are equal, so ties never
+// default to backends[0].
+func preferLowerRTT(b, current *Backend) bool {
+	b.mu.RLock()
+	bRTT := b.BaselineRTTMs
+	b.mu.RUnlock()
+	current.mu.RLock()
+	curRTT := current.BaselineRTTMs
+	current.mu.RUnlock()
+	return bRTT > 0 && (curRTT == 0 || bRTT < curRTT)
+}
+
 // ---- Round Robin --------------------------------------------------------
 
 type roundRobinSelector struct {
@@ -66,6 +79,11 @@ type lowestLatencySelector struct{}
 
 func (l *lowestLatencySelector) Name() string { return AlgoLowestLatency }
 
+// Select routes to the backend with the lowest observed network RTT
+// (BaselineRTTMs — the minimum round-trip time seen to each backend's
+// /metrics endpoint). This makes lowest_latency a pure network-proximity
+// algorithm: it always prefers the geographically closest backend regardless
+// of compute load.
 func (l *lowestLatencySelector) Select(backends []*Backend) *Backend {
 	if len(backends) == 0 {
 		return nil
@@ -119,7 +137,7 @@ haveData:
 		b.mu.RLock()
 		cpu := b.CPUPercent
 		b.mu.RUnlock()
-		if cpu < bestCPU {
+		if cpu < bestCPU || (cpu == bestCPU && preferLowerRTT(b, best)) {
 			bestCPU = cpu
 			best = b
 		}
@@ -142,7 +160,7 @@ func (l *leastConnectionsSelector) Select(backends []*Backend) *Backend {
 
 	for _, b := range backends[1:] {
 		conns := atomic.LoadInt64(&b.ActiveConns)
-		if conns < bestConns {
+		if conns < bestConns || (conns == bestConns && preferLowerRTT(b, best)) {
 			bestConns = conns
 			best = b
 		}
@@ -185,6 +203,8 @@ func (s *intelligentSelector) Select(backends []*Backend) *Backend {
 
 // selectByWeightedScore normalises each metric across backends then picks
 // the backend with the lowest combined weighted score (lower = better).
+// Uses total observed latency (network + compute) so the algorithm naturally
+// balances proximity against compute capacity without manual adjustment.
 func selectByWeightedScore(backends []*Backend, w intelligentWeights) *Backend {
 	// Round-robin until at least one backend has been polled for CPU metrics.
 	for _, b := range backends {
@@ -219,7 +239,7 @@ haveData:
 	var best *Backend
 	for i, b := range backends {
 		score := w.Latency*normLat[i] + w.CPU*normCPU[i] + w.Connections*normConn[i]
-		if score < bestScore {
+		if score < bestScore || (score == bestScore && best != nil && preferLowerRTT(b, best)) {
 			bestScore = score
 			best = b
 		}
@@ -262,7 +282,7 @@ type adaptiveSelector struct {
 func newAdaptiveSelector(backendsFunc func() []*Backend) *adaptiveSelector {
 	a := &adaptiveSelector{
 		intelligentSelector: intelligentSelector{weights: defaultWeights},
-		ticker:              time.NewTicker(30 * time.Second),
+		ticker:              time.NewTicker(10 * time.Second),
 		stopChan:            make(chan struct{}),
 		backends:            backendsFunc,
 	}
@@ -277,7 +297,9 @@ func (a *adaptiveSelector) Stop() {
 	a.ticker.Stop()
 }
 
-// adjustLoop recomputes weights every 30s based on variance of each metric.
+// adjustLoop recomputes weights every 10s based on variance of each metric.
+// 10s aligns with the metrics poll interval and gives multiple recomputations
+// within a 90s experiment window.
 func (a *adaptiveSelector) adjustLoop() {
 	for {
 		select {

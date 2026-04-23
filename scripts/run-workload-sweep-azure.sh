@@ -16,7 +16,7 @@
 #   ./scripts/run-workload-sweep-azure.sh [OPTIONS]
 #
 # Options:
-#   --duration        Xs    per-algorithm run duration      (default: 90s)
+#   --duration        Xs    per-algorithm run duration      (default: 120s)
 #   --key-file        PATH  SSH private key                 (default: ~/.ssh/id_rsa)
 #   --results         DIR   override results directory
 #   --skip-deploy           reuse running VMs (reads existing state file)
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
-DURATION="90s"
+DURATION="120s"
 KEY_FILE="$HOME/.ssh/id_rsa"
 RESULTS_DIR=""
 SKIP_DEPLOY=false
@@ -339,7 +339,7 @@ for algo in "${SAT_ALGORITHMS[@]}"; do
       -url=http://localhost:8080 \
       -mode=open \
       -rate="$rate" \
-      -duration=60s \
+      -duration=120s \
       -intensity=1 \
       -output="$SAT_DIR/${algo}_rate${rate}.csv"
 
