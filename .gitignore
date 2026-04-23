@@ -1,0 +1,9 @@
+
+# experiment raw data — too large for git
+results/**/*.csv
+results/**/*.json
+results/**/*.log
+bin/
+backend
+client
+loadbalancer
