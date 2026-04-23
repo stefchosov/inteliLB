@@ -71,22 +71,16 @@ func (l *lowestLatencySelector) Select(backends []*Backend) *Backend {
 		return nil
 	}
 	var best *Backend
-	bestLat := math.MaxFloat64
+	bestRTT := math.MaxFloat64
 	for _, b := range backends {
 		b.mu.RLock()
-		lat := b.AvgLatencyMs
-		base := b.BaselineRTTMs
+		rtt := b.BaselineRTTMs
 		b.mu.RUnlock()
-		if lat <= 0 {
+		if rtt <= 0 {
 			continue
 		}
-		// Subtract network baseline so we compare compute latency only.
-		adjusted := lat - base
-		if adjusted < 0 {
-			adjusted = 0
-		}
-		if adjusted < bestLat {
-			bestLat = adjusted
+		if rtt < bestRTT {
+			bestRTT = rtt
 			best = b
 		}
 	}
@@ -211,11 +205,7 @@ haveData:
 
 	for i, b := range backends {
 		b.mu.RLock()
-		lat := b.AvgLatencyMs - b.BaselineRTTMs
-		if lat < 0 {
-			lat = 0
-		}
-		lats[i] = lat
+		lats[i] = b.AvgLatencyMs
 		cpus[i] = b.CPUPercent
 		b.mu.RUnlock()
 		conns[i] = float64(atomic.LoadInt64(&b.ActiveConns))
