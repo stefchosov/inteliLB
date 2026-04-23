@@ -23,6 +23,12 @@ type Backend struct {
 	AvgLatencyMs   float64
 	LatencyHistory []float64
 
+	// BaselineRTTMs is the minimum observed network RTT to this backend,
+	// updated whenever a lower value is seen. Used by intelligent/adaptive
+	// to subtract network proximity from the latency score so only
+	// compute-attributable latency is compared across backends.
+	BaselineRTTMs float64
+
 	TotalRequests  int64
 	FailedRequests int64
 

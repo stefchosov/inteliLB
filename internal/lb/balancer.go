@@ -218,7 +218,9 @@ func (b *Balancer) healthCheckLoop() {
 
 func (b *Balancer) fetchMetrics(be *Backend) {
 	client := &http.Client{Timeout: 3 * time.Second}
+	start := time.Now()
 	resp, err := client.Get(be.URL + "/metrics")
+	rtt := float64(time.Since(start).Milliseconds())
 	if err != nil {
 		return
 	}
@@ -237,6 +239,10 @@ func (b *Balancer) fetchMetrics(be *Backend) {
 	be.CPUPercent = m.CPUPercent
 	be.MemPercent = m.MemPercent
 	be.CPUPolled = true
+	// Track the minimum observed RTT to this backend as a network baseline.
+	if be.BaselineRTTMs == 0 || rtt < be.BaselineRTTMs {
+		be.BaselineRTTMs = rtt
+	}
 	be.mu.Unlock()
 	atomic.StoreInt64(&be.ActiveConns, m.ActiveConns)
 }
