@@ -1,0 +1,188 @@
+================================================================================
+SECTION 1: Workload profile summary
+================================================================================
+
+Profile: cpu_only
+Algorithm                 req/s    p50ms    p99ms     err%  b1 share%
+----------------------------------------------------------------------
+round_robin                11.0    574.0   6536.0     0.0%      33.4%
+lowest_latency              7.6   2602.0   5528.0     0.0%      58.9%
+least_connections          15.4   1164.0   2315.0     0.0%      55.0%
+lowest_cpu                  7.3   2511.0   5695.0     0.0%      56.5%
+intelligent                11.0   1697.0   4716.0     0.0%      57.7%
+adaptive                    8.2   2541.0   5445.0     0.0%      60.9%
+
+Profile: high_conn
+Algorithm                 req/s    p50ms    p99ms     err%  b1 share%
+----------------------------------------------------------------------
+round_robin                40.4   3486.0  20249.0     0.0%      34.2%
+lowest_latency             30.5   7724.0  14611.0     0.0%      48.6%
+least_connections          52.3   3710.0   8530.0     0.0%      49.2%
+lowest_cpu                 34.7   5948.0  17944.0     0.0%      50.5%
+intelligent                39.4   4386.0  14458.0     0.0%      52.5%
+adaptive                   34.9   6206.0  15122.0     0.0%      54.1%
+
+Profile: io_bound
+Algorithm                 req/s    p50ms    p99ms     err%  b1 share%
+----------------------------------------------------------------------
+round_robin               350.0    288.0    303.0     0.0%      33.3%
+lowest_latency            374.5    266.0    277.0     0.0%      16.1%
+least_connections         349.2    289.0    307.0     0.0%      22.3%
+lowest_cpu                344.6    300.0    306.0     0.0%      29.6%
+intelligent               357.9    270.0    303.0     0.0%      26.7%
+adaptive                  361.6    267.0    303.0     0.0%      25.0%
+
+Profile: bimodal
+Algorithm                 req/s    p50ms    p99ms     err%  b1 share%
+----------------------------------------------------------------------
+round_robin                22.9    514.0  17063.0     0.0%      33.4%
+lowest_latency             16.3   2272.0   9132.0     0.0%      59.0%
+least_connections          32.4   1054.0   5744.0     0.0%      55.1%
+lowest_cpu                 18.9   2127.0   8938.0     0.0%      56.4%
+intelligent                20.4   2044.0   7220.0     0.0%      56.7%
+adaptive                   17.8   2136.0   9151.0     0.0%      59.5%
+
+Profile: realistic
+Algorithm                 req/s    p50ms    p99ms     err%  b1 share%
+----------------------------------------------------------------------
+round_robin                26.4    635.0  20403.0     0.0%      33.4%
+lowest_latency             18.5   6178.0  15730.0     0.0%      56.2%
+least_connections          35.9   2945.0   7952.0     0.0%      53.4%
+lowest_cpu                 23.2   1986.0  15816.0     0.0%      52.2%
+intelligent                24.1   1780.0  15947.0     0.0%      53.5%
+adaptive                   21.3   2471.0  16875.0     0.0%      56.6%
+
+================================================================================
+SECTION 2: Backend distribution by work_type (cpu_only and realistic)
+================================================================================
+
+Profile: cpu_only
+  round_robin:
+    backend-1     total=331 (33.3%)  [cpu=331]
+    backend-2     total=331 (33.3%)  [cpu=331]
+    backend-3     total=331 (33.3%)  [cpu=331]
+  lowest_latency:
+    backend-1     total=654 (96.0%)  [cpu=654]
+    backend-3     total=27 (4.0%)  [cpu=27]
+  least_connections:
+    backend-1     total=694 (50.3%)  [cpu=694]
+    backend-2     total=326 (23.6%)  [cpu=326]
+    backend-3     total=360 (26.1%)  [cpu=360]
+  lowest_cpu:
+    backend-1     total=413 (63.6%)  [cpu=413]
+    backend-2     total=164 (25.3%)  [cpu=164]
+    backend-3     total=72 (11.1%)  [cpu=72]
+  intelligent:
+    backend-1     total=611 (62.0%)  [cpu=611]
+    backend-2     total=171 (17.4%)  [cpu=171]
+    backend-3     total=203 (20.6%)  [cpu=203]
+  adaptive:
+    backend-1     total=602 (81.5%)  [cpu=602]
+    backend-2     total=81 (11.0%)  [cpu=81]
+    backend-3     total=56 (7.6%)  [cpu=56]
+
+Profile: realistic
+  round_robin:
+                  total=1 (0.0%)  [cpu=1]
+    backend-1     total=792 (33.4%)  [cpu=311, io=334, mixed=147]
+    backend-2     total=790 (33.3%)  [cpu=323, io=310, mixed=157]
+    backend-3     total=791 (33.3%)  [cpu=318, io=327, mixed=146]
+  lowest_latency:
+    backend-1     total=1476 (88.7%)  [cpu=593, io=589, mixed=294]
+    backend-3     total=188 (11.3%)  [cpu=86, io=76, mixed=26]
+  least_connections:
+    backend-1     total=1611 (49.9%)  [cpu=635, io=659, mixed=317]
+    backend-2     total=784 (24.3%)  [cpu=308, io=318, mixed=158]
+    backend-3     total=835 (25.9%)  [cpu=342, io=337, mixed=156]
+  lowest_cpu:
+    backend-1     total=1006 (48.2%)  [cpu=381, io=410, mixed=215]
+    backend-2     total=501 (24.0%)  [cpu=198, io=198, mixed=105]
+    backend-3     total=582 (27.9%)  [cpu=251, io=225, mixed=106]
+  intelligent:
+    backend-1     total=1281 (59.1%)  [cpu=508, io=502, mixed=271]
+    backend-2     total=488 (22.5%)  [cpu=197, io=176, mixed=115]
+    backend-3     total=397 (18.3%)  [cpu=167, io=157, mixed=73]
+  adaptive:
+    backend-1     total=1433 (74.9%)  [cpu=559, io=589, mixed=285]
+    backend-2     total=214 (11.2%)  [cpu=86, io=81, mixed=47]
+    backend-3     total=265 (13.9%)  [cpu=108, io=101, mixed=56]
+
+================================================================================
+SECTION 3: Saturation ramp
+================================================================================
+
+Algorithm: round_robin
+  rate achieved/s    p50ms    p99ms    err%  in-flight
+------------------------------------------------------------
+    10      10.0     71.0     89.0    0.0%        0.7
+    25      20.0     70.0     89.0    0.0%        1.8
+    50      50.1     90.0    122.0    0.0%        4.5
+    75      70.1    111.0    214.0    0.0%        8.3
+   100     100.2   1547.0  32917.0   16.4%      154.7
+   150     150.2   9476.0  40181.0   33.4%     1421.4
+   200     200.3  14395.0  52779.0   55.6%     2879.0
+  *** Saturation point: 100 req/s (err%>1% or p99>5000ms)
+
+Algorithm: least_connections
+  rate achieved/s    p50ms    p99ms    err%  in-flight
+------------------------------------------------------------
+    10      10.0     71.0     76.0    0.0%        0.7
+    25      20.0     88.0     97.0    0.0%        2.2
+    50      50.1    108.0    160.0    0.0%        5.4
+    75      70.1    129.0    230.0    0.0%        9.7
+   100     100.2    202.0    498.0    0.0%       20.2
+   150     150.2  11306.0  39743.0   35.9%     1695.9
+   200     200.3  15019.0  52294.0   58.9%     3003.8
+  *** Saturation point: 150 req/s (err%>1% or p99>5000ms)
+
+Algorithm: lowest_latency
+  rate achieved/s    p50ms    p99ms    err%  in-flight
+------------------------------------------------------------
+    10      10.0     58.0     72.0    0.0%        0.6
+    25      20.0     98.0    114.0    0.0%        2.5
+    50      50.1    142.0  19344.0    0.0%        7.1
+    75      70.1   4086.0  14410.0    5.3%      306.5
+   100     100.2   8556.0  45745.0   18.6%      855.6
+   150     150.2  14357.0  44392.0   55.9%     2153.5
+   200     200.3  19830.0  38921.0   74.4%     3966.0
+  *** Saturation point: 50 req/s (err%>1% or p99>5000ms)
+
+Algorithm: lowest_cpu
+  rate achieved/s    p50ms    p99ms    err%  in-flight
+------------------------------------------------------------
+    10      10.0     70.0   1509.0    0.0%        0.7
+    25      20.0     91.0    127.0    0.0%        2.3
+    50      50.1   2267.0   8137.0    0.0%      113.3
+    75      70.1   3344.0  14539.0    0.0%      250.8
+   100     100.2   8013.0  25549.0   10.0%      801.3
+   150     150.2  14779.0  46048.0   36.7%     2216.8
+   200     200.0  17803.0  53009.0   53.6%     3560.6
+  *** Saturation point: 50 req/s (err%>1% or p99>5000ms)
+
+Algorithm: intelligent
+  rate achieved/s    p50ms    p99ms    err%  in-flight
+------------------------------------------------------------
+    10      10.0     72.0     92.0    0.0%        0.7
+    25      20.0    102.0    131.0    0.0%        2.5
+    50      50.1    150.0   4010.0    0.0%        7.5
+    75      70.1   1669.0  10596.0    0.0%      125.2
+   100     100.2   6361.0  30767.0   10.1%      636.1
+   150     150.2  13718.0  49393.0   38.7%     2057.7
+   200     200.3  15169.0  45722.0   58.0%     3033.8
+  *** Saturation point: 75 req/s (err%>1% or p99>5000ms)
+
+Algorithm: adaptive
+  rate achieved/s    p50ms    p99ms    err%  in-flight
+------------------------------------------------------------
+    10      10.0     71.0  52113.0    0.0%        0.7
+    25      20.0     88.0     96.0    0.0%        2.2
+    50      50.1    141.0    319.0    0.0%        7.0
+    75      70.1   4142.0  32929.0    5.8%      310.7
+   100     100.0   8295.0  30614.0    4.8%      829.5
+   150     150.2  17001.0  42640.0   46.7%     2550.2
+   200     200.3  16925.0  48672.0   65.5%     3385.0
+  *** Saturation point: 10 req/s (err%>1% or p99>5000ms)
+
+================================================================================
+Full results: /epicfiles/prdfiles/zemanovic/inteliLB/results/20260423_033257_workload_sweep_azure/
+================================================================================
