@@ -7,6 +7,17 @@ import (
 	"time"
 )
 
+// warmupIdx is a shared round-robin counter used by metric-based selectors
+// before their metrics have been populated (cold-start fallback).
+var warmupIdx int64
+
+// roundRobinWarmup distributes requests evenly across backends when no
+// routing metrics are available yet.
+func roundRobinWarmup(backends []*Backend) *Backend {
+	n := int64(len(backends))
+	return backends[atomic.AddInt64(&warmupIdx, 1)%n]
+}
+
 // Algorithm names
 const (
 	AlgoRoundRobin       = "round_robin"
@@ -59,19 +70,19 @@ func (l *lowestLatencySelector) Select(backends []*Backend) *Backend {
 	if len(backends) == 0 {
 		return nil
 	}
-	best := backends[0]
-	best.mu.RLock()
-	bestLat := best.AvgLatencyMs
-	best.mu.RUnlock()
-
-	for _, b := range backends[1:] {
+	var best *Backend
+	bestLat := math.MaxFloat64
+	for _, b := range backends {
 		b.mu.RLock()
 		lat := b.AvgLatencyMs
 		b.mu.RUnlock()
-		if lat < bestLat {
+		if lat > 0 && lat < bestLat {
 			bestLat = lat
 			best = b
 		}
+	}
+	if best == nil {
+		return roundRobinWarmup(backends)
 	}
 	return best
 }
@@ -86,11 +97,21 @@ func (l *lowestCPUSelector) Select(backends []*Backend) *Backend {
 	if len(backends) == 0 {
 		return nil
 	}
+	for _, b := range backends {
+		b.mu.RLock()
+		polled := b.CPUPolled
+		b.mu.RUnlock()
+		if polled {
+			goto haveData
+		}
+	}
+	return roundRobinWarmup(backends)
+
+haveData:
 	best := backends[0]
 	best.mu.RLock()
 	bestCPU := best.CPUPercent
 	best.mu.RUnlock()
-
 	for _, b := range backends[1:] {
 		b.mu.RLock()
 		cpu := b.CPUPercent
@@ -162,6 +183,18 @@ func (s *intelligentSelector) Select(backends []*Backend) *Backend {
 // selectByWeightedScore normalises each metric across backends then picks
 // the backend with the lowest combined weighted score (lower = better).
 func selectByWeightedScore(backends []*Backend, w intelligentWeights) *Backend {
+	// Round-robin until at least one backend has been polled for CPU metrics.
+	for _, b := range backends {
+		b.mu.RLock()
+		polled := b.CPUPolled
+		b.mu.RUnlock()
+		if polled {
+			goto haveData
+		}
+	}
+	return roundRobinWarmup(backends)
+
+haveData:
 	n := len(backends)
 	lats := make([]float64, n)
 	cpus := make([]float64, n)

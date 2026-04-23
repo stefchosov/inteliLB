@@ -50,6 +50,10 @@ cleanup() {
     log "Load balancer stopped (PID $LB_PID)"
   fi
 
+  if [[ -n "${POLLER_PID:-}" ]] && kill -0 "$POLLER_PID" 2>/dev/null; then
+    kill "$POLLER_PID" 2>/dev/null || true
+  fi
+
   if [[ ${#BACKEND_PIDS[@]} -gt 0 ]]; then
     for pid in "${BACKEND_PIDS[@]}"; do
       kill "$pid" 2>/dev/null || true
@@ -134,6 +138,11 @@ workers:   $WORKERS
 duration:  $DURATION
 intensity: $INTENSITY
 algorithms: ${ALGORITHMS[*]}
+
+backends (azure mode):
+  backend-1  westus2         Standard_D2s_v3  2-vCPU VM  pinned to 1 core (taskset -c 0)
+  backend-2  northcentralus  Standard_D2s_v3  2-vCPU VM  all 2 cores available
+  backend-3  eastus2         Standard_D4s_v3  4-vCPU VM  all 4 cores available
 EOF
 
 # ── Build ─────────────────────────────────────────────────────────────────────
@@ -209,6 +218,38 @@ hr
 TOTAL_ALGORITHMS=${#ALGORITHMS[@]}
 CURRENT=0
 
+# Poll /lb/stats every 5s and append per-backend metrics to a utilization CSV.
+# Writes: elapsed_s, backend_id, cpu_percent, avg_latency_ms, active_connections
+start_utilization_poller() {
+  local algo="$1" outfile="$RESULTS_DIR/${algo}_utilization.csv"
+  echo "elapsed_s,backend_id,cpu_percent,avg_latency_ms,active_connections,total_requests" > "$outfile"
+  local t0
+  t0=$(date +%s)
+  while true; do
+    local now elapsed snap
+    now=$(date +%s)
+    elapsed=$(( now - t0 ))
+    snap=$(curl -sf --max-time 2 http://localhost:8080/lb/stats 2>/dev/null) || { sleep 5; continue; }
+    python3 -c "
+import json, sys
+data = json.loads(sys.stdin.read())
+for b in data.get('backends', []):
+    print(f\"{sys.argv[1]},{b['id']},{b['cpu_percent']:.2f},{b['avg_latency_ms']:.1f},{b['active_connections']},{b.get('total_requests',0)}\")
+" "$elapsed" <<< "$snap" >> "$outfile" 2>/dev/null || true
+    sleep 5
+  done
+}
+
+POLLER_PID=""
+
+stop_utilization_poller() {
+  if [[ -n "$POLLER_PID" ]] && kill -0 "$POLLER_PID" 2>/dev/null; then
+    kill "$POLLER_PID" 2>/dev/null || true
+    wait "$POLLER_PID" 2>/dev/null || true
+    POLLER_PID=""
+  fi
+}
+
 for algo in "${ALGORITHMS[@]}"; do
   CURRENT=$((CURRENT + 1))
   hr
@@ -217,6 +258,9 @@ for algo in "${ALGORITHMS[@]}"; do
   switch_algorithm "$algo"
   sleep 5  # let LB metrics settle after switch
 
+  start_utilization_poller "$algo" &
+  POLLER_PID=$!
+
   log "  Running client..."
   "$PROJECT_ROOT/bin/client" \
     -url=http://localhost:8080 \
@@ -224,6 +268,8 @@ for algo in "${ALGORITHMS[@]}"; do
     -duration="$DURATION" \
     -intensity="$INTENSITY" \
     -output="$RESULTS_DIR/${algo}.csv"
+
+  stop_utilization_poller
 
   log "  Saving stats snapshot..."
   curl -sf http://localhost:8080/lb/stats \

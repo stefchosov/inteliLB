@@ -17,12 +17,13 @@ import (
 type Balancer struct {
 	mu            sync.RWMutex
 	backends      []*Backend
+	proxies       map[string]*httputil.ReverseProxy
 	selector      Selector
 	totalRequests int64
 
-	pollInterval  time.Duration
+	pollInterval   time.Duration
 	healthInterval time.Duration
-	stopChan      chan struct{}
+	stopChan       chan struct{}
 }
 
 // Config holds Balancer construction options.
@@ -59,6 +60,28 @@ func New(cfg Config) (*Balancer, error) {
 			URL:     rawURL,
 			Healthy: true, // optimistic until first health check
 		})
+	}
+
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: 512,
+		MaxConnsPerHost:     0, // unlimited
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DisableKeepAlives:   false,
+	}
+
+	b.proxies = make(map[string]*httputil.ReverseProxy, len(b.backends))
+	for _, be := range b.backends {
+		be := be // capture loop variable
+		target, _ := url.Parse(be.URL)
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		proxy.Transport = transport
+		proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
+			log.Printf("proxy error to %s: %v", be.URL, err)
+			atomic.AddInt64(&be.FailedRequests, 1)
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+		}
+		b.proxies[be.ID] = proxy
 	}
 
 	b.selector = NewSelector(cfg.Algorithm, b.healthyBackends)
@@ -102,22 +125,18 @@ func (b *Balancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, _ := url.Parse(backend.URL)
-	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy := b.proxies[backend.ID]
 
 	// Wrap the response writer to capture the status code for error tracking.
 	rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+	w.Header().Set("X-Backend-ID", backend.ID)
 
 	backend.IncrConns()
 	atomic.AddInt64(&backend.TotalRequests, 1)
 	atomic.AddInt64(&b.totalRequests, 1)
 
 	start := time.Now()
-	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
-		log.Printf("proxy error to %s: %v", backend.URL, err)
-		atomic.AddInt64(&backend.FailedRequests, 1)
-		http.Error(w, "bad gateway", http.StatusBadGateway)
-	}
 	proxy.ServeHTTP(rw, r)
 
 	elapsed := float64(time.Since(start).Milliseconds())
@@ -217,6 +236,7 @@ func (b *Balancer) fetchMetrics(be *Backend) {
 	be.mu.Lock()
 	be.CPUPercent = m.CPUPercent
 	be.MemPercent = m.MemPercent
+	be.CPUPolled = true
 	be.mu.Unlock()
 	atomic.StoreInt64(&be.ActiveConns, m.ActiveConns)
 }

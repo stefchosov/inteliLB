@@ -22,11 +22,16 @@ var (
 )
 
 func main() {
-	port := flag.Int("port", 8080, "listen port")
-	region := flag.String("region", "us-east", "region label")
-	id := flag.String("id", "backend-1", "backend ID")
-	latencyMs := flag.Int("simulated-latency-ms", 0, "artificial latency in ms")
+	port      := flag.Int("port", 8080, "listen port")
+	region    := flag.String("region", "us-east", "region label")
+	id        := flag.String("id", "backend-1", "backend ID")
+	latencyMs := flag.Int("simulated-latency-ms", 0, "artificial one-way network latency in ms")
+	maxProcs  := flag.Int("max-procs", 0, "set GOMAXPROCS (0 = use runtime default)")
 	flag.Parse()
+
+	if *maxProcs > 0 {
+		runtime.GOMAXPROCS(*maxProcs)
+	}
 
 	// Allow env var overrides
 	if v := os.Getenv("PORT"); v != "" {
@@ -43,6 +48,11 @@ func main() {
 	if v := os.Getenv("SIMULATED_LATENCY_MS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			*latencyMs = n
+		}
+	}
+	if v := os.Getenv("MAX_PROCS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			runtime.GOMAXPROCS(n)
 		}
 	}
 
@@ -64,11 +74,14 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"cpu_percent":        cpuPct,
-			"memory_percent":     memPct,
-			"active_connections": conns,
-			"num_cpus":           runtime.NumCPU(),
-			"region":             *region,
+			"cpu_percent":          cpuPct,
+			"memory_percent":       memPct,
+			"active_connections":   conns,
+			"num_cpus":             runtime.NumCPU(),
+			"gomaxprocs":           runtime.GOMAXPROCS(0),
+			"simulated_latency_ms": *latencyMs,
+			"region":               *region,
+			"id":                   *id,
 		})
 	})
 
@@ -80,23 +93,54 @@ func main() {
 			time.Sleep(time.Duration(*latencyMs) * time.Millisecond)
 		}
 
+		q := r.URL.Query()
+
 		intensity := 5
-		if v := r.URL.Query().Get("intensity"); v != "" {
+		if v := q.Get("intensity"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {
 				intensity = n
 			}
 		}
 
+		workType := "cpu"
+		if v := q.Get("type"); v == "io" || v == "mixed" {
+			workType = v
+		}
+
+		// Default io_ms = intensity * 50; override with ?io_ms=N
+		ioMs := intensity * 50
+		if v := q.Get("io_ms"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				ioMs = n
+			}
+		}
+
 		start := time.Now()
-		hash := workload.RunCPUWorkParallel(intensity)
+		var hash string
+		var ioMsActual int
+
+		switch workType {
+		case "io":
+			ioMsActual = ioMs
+			time.Sleep(time.Duration(ioMs) * time.Millisecond)
+		case "mixed":
+			ioMsActual = ioMs
+			time.Sleep(time.Duration(ioMs) * time.Millisecond)
+			hash = workload.RunCPUWorkParallel(intensity)
+		default: // "cpu"
+			hash = workload.RunCPUWorkParallel(intensity)
+		}
+
 		durationMs := time.Since(start).Milliseconds()
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"result":      hash,
-			"duration_ms": durationMs,
-			"region":      *region,
-			"id":          *id,
+			"result":        hash,
+			"duration_ms":   durationMs,
+			"work_type":     workType,
+			"io_ms_actual":  ioMsActual,
+			"region":        *region,
+			"id":            *id,
 		})
 	})
 

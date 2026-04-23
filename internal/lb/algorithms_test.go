@@ -7,7 +7,7 @@ import (
 // ---- helpers ------------------------------------------------------------
 
 func makeBackend(id string, latency, cpu float64, conns int64) *Backend {
-	b := &Backend{ID: id, Healthy: true, AvgLatencyMs: latency, CPUPercent: cpu}
+	b := &Backend{ID: id, Healthy: true, AvgLatencyMs: latency, CPUPercent: cpu, CPUPolled: true}
 	b.ActiveConns = conns
 	return b
 }

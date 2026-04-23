@@ -17,6 +17,7 @@ type Backend struct {
 
 	CPUPercent  float64
 	MemPercent  float64
+	CPUPolled   bool    // set true on first successful metrics poll
 	ActiveConns int64
 
 	AvgLatencyMs   float64
