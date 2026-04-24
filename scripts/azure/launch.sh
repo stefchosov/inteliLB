@@ -48,7 +48,8 @@ launch_vm() {
   echo "  Resource group: $rg"
 
   echo "  [debug] az vm create: rg=$rg id=$id location=$location size=$vm_size"
-  set -x
+  # Ignore exit code here — Azure CLI bug causes RuntimeError in error handler
+  # which can return 0 even on SkuNotAvailable. We verify success explicitly below.
   az vm create \
     --resource-group "$rg" \
     --name "$id" \
@@ -58,8 +59,19 @@ launch_vm() {
     --admin-username azureuser \
     --generate-ssh-keys \
     --public-ip-sku Standard \
-    --output none
-  set +x
+    --output none 2>&1 || true
+
+  # Verify VM actually reached Succeeded state — catches silent CLI failures
+  local provision_state
+  provision_state=$(az vm show \
+    --resource-group "$rg" \
+    --name "$id" \
+    --query "provisioningState" \
+    --output tsv 2>/dev/null || echo "NotFound")
+  if [[ "$provision_state" != "Succeeded" ]]; then
+    echo "  VM provisioning failed or not found (state: $provision_state)"
+    return 1
+  fi
 
   local public_ip
   echo "  [debug] fetching public IP for $id..."
@@ -69,6 +81,11 @@ launch_vm() {
     --show-details \
     --query "publicIps" \
     --output tsv)
+
+  if [[ -z "$public_ip" ]]; then
+    echo "  Failed to get public IP for $id"
+    return 1
+  fi
 
   echo "  VM created — opening port 8080..."
   az vm open-port \
