@@ -1,0 +1,10 @@
+name:       realistic
+workers:    100
+intensity:  5
+mix:        cpu:40,io:40,mixed:20
+duration:   120s
+algorithms: round_robin lowest_latency least_connections lowest_cpu intelligent adaptive
+date:       Fri Apr 24 04:09:50 PM UTC 2026
+b1:  westus2         D2s_v3  1-core (taskset)
+b2:  northcentralus  D2s_v3  2-core
+b3:  eastus2         D4s_v4  4-core

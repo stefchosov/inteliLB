@@ -1,0 +1,10 @@
+name:       high_conn
+workers:    200
+intensity:  2
+mix:        cpu:100
+duration:   120s
+algorithms: round_robin lowest_latency least_connections lowest_cpu intelligent adaptive
+date:       Fri Apr 24 03:23:55 PM UTC 2026
+b1:  westus2         D2s_v3  1-core (taskset)
+b2:  northcentralus  D2s_v3  2-core
+b3:  eastus2         D4s_v4  4-core
