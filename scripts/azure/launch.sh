@@ -2,15 +2,13 @@
 # azure/launch.sh — Creates Azure VMs in 3 regions for inteliLB backends.
 #
 # CPU layout:
-#   westus2          backend-1   Standard_D2s_v3  — 2 vCPU VM, pinned to 1 core via taskset
-#   northcentralus   backend-2   Standard_D2s_v3  — 2 vCPUs
-#   eastus2          backend-3   Standard_D4s_v4  — 4 vCPUs  (v3 capacity scarce; eastus/southcentralus blocked)
+#   westus2          backend-1   Standard_D2s_v3        — 2 vCPU VM, pinned to 1 core via taskset
+#   northcentralus   backend-2   Standard_D2s_v3        — 2 vCPUs
+#   southcentralus   backend-3   Standard_D4s_v4 (etc.) — 4 vCPUs, SKU tried in priority order
 #
-# DSv3 quota per region is 4 vCPUs on Azure for Students — each backend
-# must be in its own region (2+2+4 cores across three separate quota pools).
-#
-# Azure for Students only permits VM resources in a small set of US regions;
-# northeurope/westeurope/etc. pass the RG probe but block NSG/NIC/VM creation.
+# backend-3 tries multiple SKUs/regions in order until one succeeds.
+# Confirmed blocked: eastus (policy), eastus2 (D4s_v3/v4 capacity), centralus (policy).
+# southcentralus is policy-OK; D4s_v3 capacity-restricted there, trying v4/Das_v4 next.
 #
 # Expects KEY_FILE (path to SSH public key) to be set by deploy.sh.
 
@@ -20,14 +18,22 @@ KEY_FILE="${KEY_FILE:-$HOME/.ssh/id_rsa.pub}"
 STATE_FILE="/tmp/inteliLB-azure-instances.txt"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# location  resource_group  id  vm_size
-# All backends use Dv3-series — Dv5 is NotAvailableForSubscription on
-# Azure for Students; Dv3 is confirmed available in all target regions.
-# backend-1 is still pinned to 1 core via taskset in deploy-backend.sh.
+# Fixed backends (single SKU, confirmed available).
+# backend-1 is pinned to 1 core via taskset in deploy-backend.sh.
 declare -a BACKENDS=(
   "westus2        inteliLB-westus2        backend-1   Standard_D2s_v3"
   "northcentralus inteliLB-northcentralus backend-2   Standard_D2s_v3"
-  "eastus2        inteliLB-eastus2        backend-3   Standard_D4s_v4"
+)
+
+# backend-3 candidate list: "location rg size" tried in order until one succeeds.
+# Tried and failed: eastus2/D4s_v3 (capacity), eastus2/D4s_v4 (capacity),
+#                   southcentralus/D4s_v3 (capacity), eastus (policy-blocked).
+declare -a BACKEND3_CANDIDATES=(
+  "southcentralus inteliLB-southcentralus Standard_D4s_v4"
+  "southcentralus inteliLB-southcentralus Standard_D4as_v4"
+  "southcentralus inteliLB-southcentralus Standard_D4s_v3"
+  "eastus2        inteliLB-eastus2        Standard_D4as_v4"
+  "eastus2        inteliLB-eastus2        Standard_D4s_v3"
 )
 
 launch_vm() {
@@ -35,14 +41,12 @@ launch_vm() {
 
   echo "━━━ [$location] Launching $id ($vm_size) ━━━"
 
-  # Create resource group
   az group create \
     --name "$rg" \
     --location "$location" \
     --output none
   echo "  Resource group: $rg"
 
-  # Create VM
   echo "  [debug] az vm create: rg=$rg id=$id location=$location size=$vm_size"
   set -x
   az vm create \
@@ -57,17 +61,14 @@ launch_vm() {
     --output none
   set +x
 
-  # Fetch public IP separately
   local public_ip
   echo "  [debug] fetching public IP for $id..."
-  set -x
   public_ip=$(az vm show \
     --resource-group "$rg" \
     --name "$id" \
     --show-details \
     --query "publicIps" \
     --output tsv)
-  set +x
 
   echo "  VM created — opening port 8080..."
   az vm open-port \
@@ -79,6 +80,29 @@ launch_vm() {
 
   echo "  $id UP at $public_ip"
   echo "$public_ip $id $location $rg" >> "$STATE_FILE"
+}
+
+# Try a list of "location rg size" candidates in order; return on first success.
+launch_vm_with_fallback() {
+  local id="$1"; shift
+  local candidates=("$@")
+
+  for candidate in "${candidates[@]}"; do
+    read -r location rg vm_size <<< "$candidate"
+    echo "  Trying $id: $location / $vm_size ..."
+    # Clean up any partial RG from a previous attempt
+    az group delete --name "$rg" --yes --no-wait 2>/dev/null || true
+    sleep 5
+    if launch_vm "$location" "$rg" "$id" "$vm_size"; then
+      echo "  $id launched successfully: $location / $vm_size"
+      return 0
+    else
+      echo "  FAILED: $location / $vm_size — trying next candidate"
+      az group delete --name "$rg" --yes --no-wait 2>/dev/null || true
+    fi
+  done
+  echo "ERROR: all candidates for $id exhausted — cannot deploy"
+  return 1
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -134,6 +158,9 @@ for entry in "${BACKENDS[@]}"; do
   read -r location rg id vm_size <<< "$entry"
   launch_vm "$location" "$rg" "$id" "$vm_size"
 done
+
+# backend-3: try candidates in order until one succeeds
+launch_vm_with_fallback "backend-3" "${BACKEND3_CANDIDATES[@]}"
 
 echo ""
 echo "━━━ Waiting 60s for SSH + cloud-init to finish... ━━━"
