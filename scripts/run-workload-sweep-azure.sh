@@ -10,7 +10,7 @@
 # Azure backend layout (from deploy.sh):
 #   backend-1  westus2         Standard_D2s_v3  1-core (taskset)
 #   backend-2  northcentralus  Standard_D2s_v3  2-core
-#   backend-3  southcentralus  Standard_D4s_v3  4-core
+#   backend-3  eastus2         Standard_D4s_v4  4-core
 #
 # Usage:
 #   ./scripts/run-workload-sweep-azure.sh [OPTIONS]
@@ -230,7 +230,7 @@ algorithms: ${ALGORITHMS[*]}
 date:       $(date)
 b1:  westus2         D2s_v3  1-core (taskset)
 b2:  northcentralus  D2s_v3  2-core
-b3:  southcentralus  D4s_v3  4-core
+b3:  eastus2         D4s_v4  4-core
 EOF
 
   # Start LB locally
