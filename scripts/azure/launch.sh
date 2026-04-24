@@ -4,7 +4,7 @@
 # CPU layout:
 #   westus2        backend-1   Standard_D2s_v3  — 2 vCPU VM, pinned to 1 core via taskset
 #   northcentralus backend-2   Standard_D2s_v3  — 2 vCPUs
-#   eastus2        backend-3   Standard_D4s_v3  — 4 vCPUs
+#   eastus         backend-3   Standard_D4s_v3  — 4 vCPUs  (eastus2 excluded: OSProvisioningTimedOut)
 #
 # DSv3 quota per region is 4 vCPUs on Azure for Students — each backend
 # must be in its own region (2+2+4 cores across three separate quota pools).
@@ -27,7 +27,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 declare -a BACKENDS=(
   "westus2        inteliLB-westus2        backend-1   Standard_D2s_v3"
   "northcentralus inteliLB-northcentralus backend-2   Standard_D2s_v3"
-  "eastus2        inteliLB-eastus2        backend-3   Standard_D4s_v3"
+  "eastus         inteliLB-eastus         backend-3   Standard_D4s_v3"
 )
 
 launch_vm() {
