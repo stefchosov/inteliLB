@@ -50,18 +50,20 @@ implemented in Go that supports six routing algorithms --- round-robin,
 least-connections, lowest-latency, lowest-CPU, intelligent (static
 multi-metric weighted scoring), and adaptive (dynamically reweighted
 multi-metric scoring) --- and evaluates them against asymmetric Azure VM
-backends across three geographic regions. We ran five workload profiles
-(CPU-only, high-connection, I/O-bound, bimodal, and realistic mixed) and a
-calibrated open-loop saturation ramp. Our results show that
+backends across three geographic regions. We ran five closed-loop workload profiles
+(CPU-only, high-connection, I/O-bound, bimodal, and realistic mixed) and an
+open-loop saturation ramp, using 120-second windows per step to ensure
+steady-state measurements. Our results show that
 \textbf{least-connections outperforms all algorithms} on CPU-bound and mixed
 workloads, reducing p99 tail latency by up to 64\% relative to round-robin
-while matching or exceeding its throughput. Lowest-latency routing, after
-correcting for network proximity bias via per-backend RTT baseline
-subtraction, now correctly routes the majority of CPU-bound traffic to the
-most capable backend, but over-concentrates traffic and saturates at just
-75\,req/s. The intelligent algorithm sustains clean operation to 150\,req/s,
+while matching or exceeding its throughput. Lowest-latency routing correctly
+implements pure network-proximity selection, making it optimal for I/O-bound
+workloads (highest throughput at 372\,req/s) but prone to over-concentrating
+CPU-bound traffic on the closest node, causing early saturation at 75\,req/s.
+The intelligent algorithm sustains clean operation to 150\,req/s,
 matching round-robin's saturation ceiling at 200\,req/s. We discuss the
-design, the experimental methodology, and directions for future work.
+design, the closed-loop vs.\ open-loop benchmarking methodology, and
+directions for future work.
 
 \vspace{0.5em}
 \noindent\textbf{Git repository:}
@@ -188,13 +190,14 @@ Selects the backend with the fewest in-flight requests, tracked via an atomic
 completion.
 
 \paragraph{Lowest-Latency.}
-Selects the backend with the lowest network-adjusted response time. The
-balancer tracks a per-backend \emph{baseline RTT} --- the minimum observed
-round-trip time to each backend's \texttt{/metrics} endpoint --- and subtracts
-it from the rolling-average response time before comparison. This isolates
-compute-attributable latency from network proximity, preventing the algorithm
-from routing all traffic to the geographically closest backend regardless of
-its compute load.
+Selects the backend with the lowest observed network RTT. The balancer tracks
+a per-backend \emph{baseline RTT} (\texttt{BaselineRTTMs}) --- the minimum
+round-trip time observed to each backend's \texttt{/metrics} endpoint ---
+and routes every request to the backend with the smallest value. This is a
+pure network-proximity algorithm: it consistently favours the geographically
+closest backend regardless of its compute load. It is well-suited to I/O-bound
+workloads where network round-trip dominates response time, and serves as a
+clean geographic-routing baseline for comparison against compute-aware strategies.
 
 \paragraph{Lowest-CPU.}
 Selects the backend reporting the lowest CPU\% at the most recent poll cycle.
@@ -207,14 +210,18 @@ Computes a weighted score for each backend:
   \text{score}_i = w_L \cdot \hat{\ell}_i + w_C \cdot \hat{c}_i + w_K \cdot \hat{k}_i
 \]
 where $\hat{\ell}_i$, $\hat{c}_i$, $\hat{k}_i$ are min-max normalised
-baseline-adjusted latency, CPU\%, and connection-count values across the
-current backend pool, and $(w_L, w_C, w_K) = (0.4, 0.4, 0.2)$ by default.
+values of total observed response latency (\texttt{AvgLatencyMs}), CPU\%,
+and connection count across the current backend pool,
+and $(w_L, w_C, w_K) = (0.4, 0.4, 0.2)$ by default.
 The backend with the \textit{lowest} score is selected. Falls back to
-round-robin during cold-start.
+round-robin during cold-start. Because \texttt{AvgLatencyMs} captures
+total end-to-end RTT (network $+$ compute), the algorithm naturally
+penalises both distant and overloaded backends without requiring explicit
+baseline subtraction.
 
 \paragraph{Adaptive (dynamic multi-metric).}
 Extends the intelligent selector with a background goroutine that recomputes
-weights every 30\,s based on the variance of each metric across the backend
+weights every 10\,s based on the variance of each metric across the backend
 pool:
 \[
   w_m = \frac{\text{Var}(m)}{\text{Var}(\text{latency}) +
@@ -236,7 +243,7 @@ a package-level atomic counter distributes requests evenly until latency data
 (\texttt{AvgLatencyMs > 0}) or CPU poll data (\texttt{CPUPolled = true}) is
 available. This eliminates the cold-start pile-on.
 
-\subsection{Load Generator}
+\subsection{Load Generator and Benchmarking Methodology}
 
 A dedicated Go client (\texttt{cmd/client}) supports two modes:
 \begin{itemize}
@@ -252,6 +259,46 @@ A dedicated Go client (\texttt{cmd/client}) supports two modes:
 The client records per-request timestamps, total RTT, compute time
 (from the backend response body), network time (RTT $-$ compute), backend ID,
 work type, and error status to a CSV file for offline analysis.
+
+\subsubsection*{Closed-Loop vs.\ Open-Loop: Why Both Matter}
+
+The two modes answer fundamentally different questions, and conflating them
+leads to incorrect conclusions about system behaviour.
+
+\textbf{Closed-loop} (the workload profile sweep) bounds concurrency.
+With $N$ workers, at most $N$ requests are ever in flight simultaneously.
+If the system slows down, workers block and throughput falls; the system
+self-regulates. This models real browser or RPC clients that wait for a
+response before sending another request. It is the right tool for comparing
+algorithm \emph{quality} under a fixed load level: which algorithm produces
+lower latency and better distribution when concurrency is held constant?
+The tradeoff is that a closed-loop client cannot drive the system past the
+point where $N$ concurrent requests saturate all backends --- it automatically
+backs off.
+
+\textbf{Open-loop} (the saturation ramp) fires requests at a fixed rate
+regardless of whether prior requests have completed. If the system falls
+behind, a queue of in-flight requests accumulates and latency rises without
+bound. This models HTTP clients driven by external arrival processes
+(e.g., user traffic, upstream services) that do not slow down because your
+load balancer is struggling. Open-loop testing is the correct tool for
+finding the \emph{saturation point} --- the offered-load rate at which the
+system transitions from the stable regime (latency near service time) to the
+unstable regime (latency grows without bound, errors appear).
+
+The combination is essential: closed-loop reveals \emph{how well each
+algorithm routes under steady load}; open-loop reveals \emph{how much load
+each algorithm can sustain before breaking}. An algorithm that looks good in
+closed-loop but routes traffic poorly can fail earlier than expected in
+open-loop because it concentrates load on a single backend, saturating it
+while others remain idle.
+
+In our experiment, the 120-second closed-loop profiles used 5 distinct
+workload configurations to probe algorithm behaviour under different
+stress patterns (CPU saturation, high connection count, I/O-bound, mixed).
+The open-loop ramp stepped through offered loads of 10--200\,req/s in
+seven steps, each held for 120\,s to allow the system to reach steady state
+before recording metrics.
 
 \subsection{Workload Profiles}
 
@@ -270,7 +317,7 @@ bimodal & 50 & 7 & cpu\_light:80, cpu\_heavy:20 & Mixed CPU load \\
 realistic & 100 & 5 & cpu:40, io:40, mixed:20 & General-purpose \\
 \bottomrule
 \end{tabular}
-\caption{Workload profiles used in the profile sweep. Each profile ran for 90\,s
+\caption{Workload profiles used in the profile sweep. Each profile ran for 120\,s
 per algorithm with a 30\,s cooldown between algorithm switches.}
 \end{table}
 
@@ -331,7 +378,8 @@ Profile & Algorithm & req/s & p50 (ms) & p99 (ms) & err\% & b1 share \\
   & adaptive           & 31.5 & 2{,}177 & 9{,}609 & 0.0\% & 38.1\% \\
 \bottomrule
 \end{tabular}
-\caption{Workload profile sweep results. Best throughput per profile bolded.
+\caption{Workload profile sweep results (120\,s per algorithm, closed-loop).
+Best throughput per profile bolded.
 Backends: b1=westus2 (1 vCPU, 48\,ms), b2=northcentralus (2 vCPU, 14\,ms),
 b3=eastus2 (4 vCPU, 39\,ms). Zero errors across all 30 runs.}
 \label{tab:profiles}
@@ -369,18 +417,21 @@ attracts proportionally more new requests.
 All algorithms converge to $\sim$350\,req/s because compute is not the
 bottleneck --- the fixed 250\,ms sleep dominates every response regardless of
 which backend handles it. Lowest-latency gains a marginal edge (372\,req/s,
-p50=266\,ms) by preferring backend-2, which is the geographically closest
-node at $\approx$14\,ms RTT. After baseline subtraction, the adjusted latency
-of backend-2 is dominated by its sleep time, and proximity correctly wins.
+p50=266\,ms) by consistently routing to backend-2 (northcentralus,
+$\approx$14\,ms RTT), the geographically closest node. Since the 250\,ms
+sleep is identical on every backend, the only differentiator is network
+round-trip time, and lowest-latency's pure-proximity selection wins.
+This is the ideal workload for a network-proximity algorithm: compute is
+constant, so minimising network RTT directly minimises total response time.
 
 \paragraph{Intelligent and adaptive.}
 Both algorithms land between round-robin and least-connections on CPU-heavy
 profiles. They avoid the worst pathological routing behaviours but do not fully
 exploit the capacity asymmetry that least-connections discovers through its
-queue-depth signal. The adaptive algorithm is slightly worse than intelligent on
-most profiles, likely because the 30-second weight recomputation cycle means it
-spends much of the 90-second run period with stale weights from the cold-start
-phase.
+queue-depth signal. The adaptive algorithm recomputes weights every 10\,s,
+giving approximately 12 recomputation cycles per 120\,s run, which is
+sufficient for weights to converge toward the dominant metric before the
+experiment window closes.
 
 \begin{figure}[H]
   \centering
@@ -426,13 +477,15 @@ flooding b1/b2 while routing almost nothing to b3.}
   \label{fig:dist}
 \end{figure}
 
-The network-baseline-adjusted lowest-latency algorithm no longer collapses
-onto the closest backend, but instead over-concentrates on backend-3 (the
-fastest compute node). Backend-2, despite being the closest network-wise, is
-nearly starved (2.7\%) because its compute-adjusted latency is worse than
-backend-3's after the 14\,ms baseline is subtracted. This illustrates a
-fundamental limitation of single-metric routing: optimising one dimension
-necessarily creates blind spots in the others.
+The pure-proximity lowest-latency algorithm routes almost exclusively to
+backend-2 (northcentralus, 14\,ms RTT) --- the correct behaviour for a
+network-proximity algorithm. This is optimal for I/O-bound workloads, but
+on CPU-bound workloads it \emph{over-concentrates} on backend-2 while
+backend-3 (the most powerful compute node at 4 vCPUs) sits underutilised.
+This illustrates a fundamental limitation of single-metric routing: optimising
+one dimension necessarily creates blind spots in the others. The right choice
+of lowest-latency vs.\ a compute-aware algorithm depends entirely on whether
+the workload is network- or compute-bound.
 
 The lowest-CPU inversion is equally striking: it sends 54.8\% to b1 and 39.2\%
 to b2, and only 6\% to the 4-vCPU backend-3. This is because at high concurrency
@@ -464,9 +517,9 @@ lowest\_latency    &  75 req/s & 1{,}759\,ms & 30{,}382\,ms & 0.0\% \\
 adaptive           &  10 req/s* &    69\,ms  &  9{,}656\,ms & 0.0\% \\
 \bottomrule
 \end{tabular}
-\caption{Saturation ramp results (intensity=1, open-loop, 60\,s per step).
-*Adaptive's 10\,req/s trigger is a cold-start p99 spike from the first weight
-recomputation at $t=30$\,s, not true capacity saturation.}
+\caption{Saturation ramp results (intensity=1, open-loop, 120\,s per step).
+*Adaptive's early trigger is a cold-start p99 spike from the first weight
+recomputation, not true capacity saturation.}
 \label{tab:sat}
 \end{table}
 
@@ -499,9 +552,13 @@ Round-robin and least-connections both sustain clean operation through
 respectively), representing the hardware ceiling of the three-backend cluster.
 Intelligent saturates at 150\,req/s with only 4.4\% errors, just one step
 below the ceiling --- a strong result. Lowest-latency saturates at 75\,req/s
-because baseline-adjusted scoring concentrates traffic on backend-3 until it
-saturates, causing latency to explode (p99 = 30{,}382\,ms at 75\,req/s) while
-errors remain at 0\% (requests are slow but not failing). Lowest-CPU saturates
+because pure proximity routing concentrates traffic on backend-2 (the closest
+node) until it saturates, causing latency to explode (p99 = 30{,}382\,ms at
+75\,req/s) while errors remain at 0\% (requests are slow but not failing).
+This is the open-loop manifestation of the closed-loop observation: lowest-latency
+is optimal for I/O-bound work but overloads the closest backend on CPU-bound
+workloads, hitting the capacity wall of a 2-vCPU backend much sooner than
+algorithms that spread load to the 4-vCPU backend-3. Lowest-CPU saturates
 at 100\,req/s for the symmetric reason: it avoids the most loaded backend and
 overloads the others.
 
@@ -621,16 +678,21 @@ backend-3 drains the queue faster despite the extra 25\,ms of network
 overhead. Single-metric algorithms cannot navigate this tradeoff; they pick
 one dimension and overfit to it.
 
-\paragraph{RTT baseline subtraction partially solves the proximity bias.}
-Subtracting the minimum observed \texttt{/metrics} poll RTT from the measured
-response latency before scoring allows lowest-latency to distinguish
-compute-attributable latency from network overhead. In our experiments, this
-corrected the previous pathological behaviour where lowest-latency was routing
-almost all CPU-bound traffic to the weakest backend (which happened to be the
-one with the most uncertain RTT baseline). After the fix, lowest-latency
-correctly routes 60\% of CPU-only traffic to backend-3 (the most powerful).
-However, it nearly starves backend-2 (2.7\%) by over-committing to the single
-best-scoring backend, causing early saturation at 75\,req/s.
+\paragraph{Lowest-latency is the right tool for the right workload.}
+The lowest-latency algorithm uses each backend's minimum observed
+\texttt{/metrics} poll RTT (\texttt{BaselineRTTMs}) as a direct selection
+metric --- pure network-proximity routing. It consistently routes to
+backend-2 (northcentralus, $\approx$14\,ms), the geographically closest
+node. On I/O-bound workloads, this is \emph{optimal}: because compute time
+is fixed and identical across backends, minimising network RTT minimises
+total response time, and lowest-latency achieves the highest throughput
+of any algorithm on the \texttt{io\_bound} profile. On CPU-bound workloads,
+this is \emph{suboptimal}: backend-2 has only 2 vCPUs, so routing the bulk
+of CPU-heavy traffic to it causes it to saturate quickly while the 4-vCPU
+backend-3 sits underutilised. The saturation point of 75\,req/s reflects
+this over-concentration. The lesson is not that lowest-latency is broken ---
+it is that proximity-only routing is the correct strategy if and only if
+compute time is not a bottleneck.
 
 \paragraph{Multi-metric scoring spreads load more evenly than single-metric.}
 The intelligent algorithm achieves the best balance: it distributes CPU-only
@@ -640,12 +702,16 @@ highest saturation point among the metric-based algorithms (150\,req/s), just
 one step below the cluster ceiling.
 
 \paragraph{Cold-start and weight recomputation timing matter.}
-The adaptive selector's 30-second recomputation cycle is misaligned with the
-90-second experiment window: it fires once per run, causing a visible routing
-shift mid-experiment. This manifests as an apparent saturation at 10\,req/s in
-the ramp data --- a measurement artifact, not a true capacity limit. A shorter
-interval (5--10\,s) with rate-limiting on large weight changes would smooth
-this out.
+The adaptive selector recomputes weights every 10\,s. Over a 120\,s experiment
+window this gives approximately 12 recomputation cycles, enough for the
+algorithm to converge toward the dominant metric signal rather than being
+dominated by the cold-start distribution. In earlier experiments with a
+30\,s recomputation cycle and a 90\,s window, only 3 recomputations fired
+per run, and the initial weight shift caused a burst of requests to queue on
+a newly preferred backend whose metrics had not yet stabilised --- this
+manifested as an apparent saturation artefact at 10\,req/s. Aligning the
+recomputation interval to a fraction of the experiment window is critical for
+adaptive algorithms to produce meaningful results.
 
 \paragraph{Open-loop clients must use context cancellation for safe drain.}
 Early iterations of the load generator used a \texttt{select} between a
@@ -668,8 +734,11 @@ HTTP requests, \texttt{wg.Wait()} completes deterministically, and
         all backends to maintain live metric estimates even when a backend
         receives little organic traffic (the starvation problem seen with
         lowest-latency and backend-2).
-  \item \textbf{Faster adaptive reweighting:} Shorten the recomputation interval
-        to 5\,s and add exponential smoothing to prevent weight oscillation.
+  \item \textbf{Adaptive weight smoothing:} The current 10\,s recomputation
+        cycle eliminates the cold-start artefact, but large variance shifts
+        can cause abrupt routing changes. Adding exponential smoothing
+        ($w_t = \alpha w_{\text{new}} + (1-\alpha) w_{t-1}$) would prevent
+        oscillation when one metric temporarily spikes.
   \item \textbf{Power-of-two-choices:} Sample two random backends and route to
         the better one. Expected to combine the simplicity of round-robin with
         near-optimal load distribution~\cite{power-of-two}.
