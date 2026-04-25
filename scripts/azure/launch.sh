@@ -38,6 +38,8 @@ declare -a BACKEND3_CANDIDATES=(
 
 launch_vm() {
   local location="$1" rg="$2" id="$3" vm_size="$4"
+  # DNS label: must be lowercase, e.g. intelilb-backend-1.westus2.cloudapp.azure.com
+  local dns_label="intelilb-${id}"
 
   echo "━━━ [$location] Launching $id ($vm_size) ━━━"
 
@@ -59,6 +61,7 @@ launch_vm() {
     --admin-username azureuser \
     --generate-ssh-keys \
     --public-ip-sku Standard \
+    --public-ip-address-dns-name "$dns_label" \
     --output none 2>&1 || true
 
   # Verify VM actually reached Succeeded state — catches silent CLI failures
@@ -73,8 +76,8 @@ launch_vm() {
     return 1
   fi
 
-  local public_ip
-  echo "  [debug] fetching public IP for $id..."
+  local public_ip fqdn
+  echo "  [debug] fetching public IP and DNS name for $id..."
   public_ip=$(az vm show \
     --resource-group "$rg" \
     --name "$id" \
@@ -87,6 +90,12 @@ launch_vm() {
     return 1
   fi
 
+  # Fetch the FQDN assigned by Azure (intelilb-<id>.<region>.cloudapp.azure.com)
+  fqdn=$(az network public-ip list \
+    --resource-group "$rg" \
+    --query "[0].dnsSettings.fqdn" \
+    --output tsv 2>/dev/null || echo "")
+
   echo "  VM created — opening port 8080..."
   az vm open-port \
     --resource-group "$rg" \
@@ -95,8 +104,8 @@ launch_vm() {
     --priority 1001 \
     --output none
 
-  echo "  $id UP at $public_ip"
-  echo "$public_ip $id $location $rg" >> "$STATE_FILE"
+  echo "  $id UP at $public_ip ($fqdn)"
+  echo "$public_ip $id $location $rg $fqdn" >> "$STATE_FILE"
 }
 
 # Try a list of "location rg size" candidates in order; return on first success.
@@ -189,7 +198,7 @@ if [[ "$SSH_PRIVATE_KEY" == "$KEY_FILE" ]]; then
   SSH_PRIVATE_KEY="$HOME/.ssh/id_rsa"
 fi
 
-while IFS=' ' read -r ip id location rg; do
+while IFS=' ' read -r ip id location rg fqdn; do
   echo "Deploying $id on $ip ($location)..."
   PUBLIC_IP="$ip" \
   SSH_USER="azureuser" \
@@ -206,8 +215,9 @@ echo "All Azure backends deployed. Run the load balancer locally:"
 echo ""
 
 BACKEND_URLS=""
-while IFS=' ' read -r ip id location rg; do
-  BACKEND_URLS+="http://$ip:8080,"
+while IFS=' ' read -r ip id location rg fqdn; do
+  host="${fqdn:-$ip}"
+  BACKEND_URLS+="http://$host:8080,"
 done < "$STATE_FILE"
 BACKEND_URLS="${BACKEND_URLS%,}"
 
@@ -217,7 +227,8 @@ echo "    -algorithm=intelligent \\"
 echo "    -backends=\"$BACKEND_URLS\""
 echo ""
 echo "VM layout:"
-while IFS=' ' read -r ip id location rg; do
-  printf "  %-12s  %-10s  http://%s:8080\n" "$location" "$id" "$ip"
+while IFS=' ' read -r ip id location rg fqdn; do
+  host="${fqdn:-$ip}"
+  printf "  %-16s  %-12s  %s\n" "$location" "$id" "$host"
 done < "$STATE_FILE"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

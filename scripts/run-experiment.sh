@@ -189,7 +189,7 @@ else
 
   [[ -f "$AZURE_STATE" ]] || die "Azure state file not found after deploy"
 
-  while IFS=' ' read -r ip id location rg; do
+  while IFS=' ' read -r ip id location rg fqdn; do
     BACKEND_URLS+="http://$ip:8080,"
     wait_healthy "http://$ip:8080" "$id ($location)"
   done < "$AZURE_STATE"

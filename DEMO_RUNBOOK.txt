@@ -1,0 +1,216 @@
+inteliLB demo — ~10 min end-to-end
+================================================================================
+
+Backends need to already be up on Azure. If they're not, run ./scripts/deploy.sh
+first — that takes about 10 min and I only need to do it once.
+
+Settings I'm using:
+  20 workers, 30s runs, intensity 7, 20s cooldown between algos
+  (20 workers at intensity 7 saturates backend-1's single vCPU while
+   backend-2 and backend-3 still have room — that gap is what makes
+   the smart algorithms look better than round robin)
+
+Rough timing:
+  setup ~1 min + 6x 30s runs + 5x 20s cooldowns + teardown ~1 min = ~7 min total
+
+================================================================================
+1. START UP
+================================================================================
+
+Open two terminals in the project root.
+  Terminal A — LB process, stays open the whole time
+  Terminal B — where I run client commands
+
+Terminal A — paste in the backend IPs from the deploy output:
+
+  go run ./cmd/loadbalancer \
+    -port=8080 \
+    -algorithm=round_robin \
+    -backends="http://<eastus-ip>:8080,http://<westus2-ip>:8080,http://<eastus2-ip2>:8080"
+
+Wait for: load balancer listening on :8080
+
+Terminal B — make sure all 3 backends are healthy before starting:
+
+  curl http://localhost:8080/lb/stats | python3 -m json.tool
+
+All three should show "healthy": true. If any don't, stop and debug before demoing.
+
+  mkdir -p results/demo
+
+================================================================================
+2. RUN THE ALGORITHMS
+================================================================================
+
+────────────────────────────────
+round_robin  (1/6)
+────────────────────────────────
+
+  curl -s -X POST http://localhost:8080/lb/algorithm \
+    -H "Content-Type: application/json" \
+    -d '{"algorithm":"round_robin"}' | python3 -m json.tool
+
+  go run ./cmd/client \
+    -url=http://localhost:8080 \
+    -workers=20 \
+    -duration=30s \
+    -intensity=7 \
+    -output=results/demo/round_robin.csv
+
+  curl -s http://localhost:8080/lb/stats > results/demo/round_robin_stats.json
+  echo "cooling..."; sleep 20
+
+  Point out: ~33% to each backend. Backend-1 is hammered — high CPU, high latency.
+  This is the baseline that everything else should beat.
+
+────────────────────────────────
+lowest_latency  (2/6)
+────────────────────────────────
+
+  curl -s -X POST http://localhost:8080/lb/algorithm \
+    -H "Content-Type: application/json" \
+    -d '{"algorithm":"lowest_latency"}' | python3 -m json.tool
+
+  go run ./cmd/client \
+    -url=http://localhost:8080 \
+    -workers=20 \
+    -duration=30s \
+    -intensity=7 \
+    -output=results/demo/lowest_latency.csv
+
+  curl -s http://localhost:8080/lb/stats > results/demo/lowest_latency_stats.json
+  echo "cooling..."; sleep 20
+
+  Point out: traffic chases the closest backend. Can still pile onto one backend
+  if it happens to look fast at the start — doesn't know anything about CPU.
+
+────────────────────────────────
+least_connections  (3/6)
+────────────────────────────────
+
+  curl -s -X POST http://localhost:8080/lb/algorithm \
+    -H "Content-Type: application/json" \
+    -d '{"algorithm":"least_connections"}' | python3 -m json.tool
+
+  go run ./cmd/client \
+    -url=http://localhost:8080 \
+    -workers=20 \
+    -duration=30s \
+    -intensity=7 \
+    -output=results/demo/least_connections.csv
+
+  curl -s http://localhost:8080/lb/stats > results/demo/least_connections_stats.json
+  echo "cooling..."; sleep 20
+
+  Point out: completely blind to CPU. When all connection counts tie (which happens
+  a lot), it defaults to backend-1 every time — the tie-breaking bug I found.
+
+────────────────────────────────
+lowest_cpu  (4/6)
+────────────────────────────────
+
+  curl -s -X POST http://localhost:8080/lb/algorithm \
+    -H "Content-Type: application/json" \
+    -d '{"algorithm":"lowest_cpu"}' | python3 -m json.tool
+
+  go run ./cmd/client \
+    -url=http://localhost:8080 \
+    -workers=20 \
+    -duration=30s \
+    -intensity=7 \
+    -output=results/demo/lowest_cpu.csv
+
+  curl -s http://localhost:8080/lb/stats > results/demo/lowest_cpu_stats.json
+  echo "cooling..."; sleep 20
+
+  Point out: almost everything goes to backend-3 (4 vCPUs, lowest CPU).
+  Good at avoiding overload but ignores network — backend-3 might be geographically
+  further away, so latency can actually get worse.
+
+────────────────────────────────
+intelligent  (5/6)
+────────────────────────────────
+
+  curl -s -X POST http://localhost:8080/lb/algorithm \
+    -H "Content-Type: application/json" \
+    -d '{"algorithm":"intelligent"}' | python3 -m json.tool
+
+  go run ./cmd/client \
+    -url=http://localhost:8080 \
+    -workers=20 \
+    -duration=30s \
+    -intensity=7 \
+    -output=results/demo/intelligent.csv
+
+  curl -s http://localhost:8080/lb/stats > results/demo/intelligent_stats.json
+  echo "cooling..."; sleep 20
+
+  Point out: static weights — 40% latency, 40% CPU, 20% connections. Normalizes
+  all three metrics and picks the best combined score. Avoids backend-1 without
+  blindly dumping everything on backend-3.
+
+────────────────────────────────
+adaptive  (6/6 — no cooldown)
+────────────────────────────────
+
+  curl -s -X POST http://localhost:8080/lb/algorithm \
+    -H "Content-Type: application/json" \
+    -d '{"algorithm":"adaptive"}' | python3 -m json.tool
+
+  go run ./cmd/client \
+    -url=http://localhost:8080 \
+    -workers=20 \
+    -duration=30s \
+    -intensity=7 \
+    -output=results/demo/adaptive.csv
+
+  curl -s http://localhost:8080/lb/stats > results/demo/adaptive_stats.json
+
+  Point out: same as intelligent but the weights shift every 30s based on how much
+  variance there is across backends. In this 30s run it gets one recompute cycle.
+  In the full 120s experiment it converges further — CPU variance is high so it
+  effectively becomes lowest_cpu dynamically.
+
+================================================================================
+3. SUMMARY TABLE
+================================================================================
+
+  python3 scripts/demo_summary.py results/demo
+
+================================================================================
+4. TEARDOWN
+================================================================================
+
+Ctrl+C in Terminal A to kill the LB, then:
+
+  ./scripts/azure/teardown.sh
+
+Double-check it's actually gone (costs money until it is):
+
+  az group list \
+    --query "[?contains(name,'inteliLB')].{Name:name,State:properties.provisioningState}" \
+    -o table
+
+================================================================================
+QUESTIONS I MIGHT GET
+================================================================================
+
+Why 3 backends with different vCPUs?
+  To simulate heterogeneous infra — cloud spot instances, preemptible nodes, mixed
+  VM generations. If all backends were identical, routing strategy wouldn't matter.
+
+Why does backend-1 get so many requests with some algorithms?
+  Tie-breaking bug — least_connections and lowest_cpu both initialize to backends[0]
+  and only switch on a strict less-than. When metrics are equal at startup, backend-1
+  wins every single decision.
+
+Why is intelligent better than just lowest_cpu?
+  lowest_cpu ignores network entirely. If the lowest-CPU backend is far away,
+  you trade CPU headroom for worse latency. Intelligent blends both so you don't
+  tank one metric to optimize the other.
+
+What does adaptive actually add over intelligent?
+  Intelligent has fixed weights (40/40/20). Adaptive figures out which metric is
+  actually varying most right now and weights that higher. Under CPU-heavy load it
+  becomes more like lowest_cpu. Under uniform load it backs off and weights more
+  evenly.

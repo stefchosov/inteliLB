@@ -1,0 +1,239 @@
+Network Concepts — inteliLB Cheat Sheet
+================================================================================
+
+LOAD BALANCER BASICS
+────────────────────
+Reverse proxy
+  Sits in front of backend servers. Clients talk to the LB, not the backends
+  directly. The LB forwards requests and returns responses. Hides backend
+  topology from the client.
+
+L4 vs L7 load balancing
+  L4 (transport layer) — routes based on IP + TCP port only. Fast, no HTTP
+    awareness. Can't inspect URLs, headers, or response codes.
+  L7 (application layer) — routes based on HTTP content (URL, headers, body).
+    inteliLB is L7: it reads HTTP responses to measure backend latency and
+    health, and can make routing decisions per-request.
+
+Health check
+  The LB periodically probes each backend (GET /health) to confirm it's alive.
+  Unhealthy backends are removed from the routing pool until they recover.
+  Without this, the LB would keep sending requests into a dead backend.
+
+Sticky sessions
+  Routing that sends the same client to the same backend every time (usually
+  via cookie or source IP hash). inteliLB doesn't implement this — every
+  request is routed independently.
+
+================================================================================
+
+LATENCY & THROUGHPUT
+────────────────────
+RTT (Round Trip Time)
+  Time for a packet to travel from A to B and back. The minimum possible
+  latency for a request is one RTT (network only, no compute). Cross-region
+  RTTs in this project: ~20ms (same coast), ~80-200ms (US to Europe).
+
+End-to-end latency
+  Total time from client sends request to client receives response.
+  = network (client→LB) + network (LB→backend) + compute + network back.
+  In this project the client→LB hop is localhost (near zero).
+
+p50 / p95 / p99
+  Percentile latencies. p99=500ms means 99% of requests finished in under
+  500ms, 1% took longer. p99 is the "tail" — what slow users actually see.
+  p50 is the median. Always look at p99 for a real picture of user experience.
+
+Throughput (req/s)
+  How many requests the system completes per second. Throughput and latency
+  are related — as you approach saturation, latency spikes before throughput
+  drops. That spike in p99 is usually the first sign of trouble.
+
+Little's Law
+  avg_in_flight = throughput × avg_latency
+  If throughput is 100 req/s and avg latency is 200ms, there are ~20 requests
+  in flight at any moment. Useful for understanding connection counts.
+
+================================================================================
+
+NETWORKING CONCEPTS
+───────────────────
+TCP connection
+  A stateful, reliable channel between two endpoints. The LB opens one TCP
+  connection per proxied request (no connection pooling in this implementation).
+  Each connection has overhead: 3-way handshake (~1 RTT) before any data flows.
+
+Active connections
+  Number of TCP connections currently open between the LB and a backend.
+  Used by least_connections routing. High active connections = backend is busy
+  or slow to respond.
+
+Bandwidth vs latency
+  Bandwidth — how much data per second the link can carry.
+  Latency — how long a single packet takes to arrive.
+  A high-bandwidth link can still have high latency (satellite internet).
+  For small HTTP requests like this project, latency dominates — bandwidth
+  is rarely the bottleneck.
+
+DNS (Domain Name System)
+  Translates hostnames to IP addresses via a hierarchy of servers.
+  When your LB connects to intelilb-backend-1.westus2.cloudapp.azure.com:
+    1. Your OS checks its local cache — if it has a recent answer, done.
+    2. Asks your router/ISP's resolver.
+    3. Resolver walks the hierarchy: root → .com → azure.com → answer.
+    4. Answer is cached for the TTL (time-to-live) period, then discarded.
+  Azure VMs get a DNS name only if you pass --public-ip-address-dns-name
+  at creation time. Without it, the VM only has a raw IP.
+
+  FQDN (Fully Qualified Domain Name)
+    A complete, unambiguous hostname ending at the DNS root:
+      intelilb-backend-1.westus2.cloudapp.azure.com
+      └─ label ─┘└─── subdomain ───┘└── domain ──┘└ root (implied)
+    Every label is explicit — no assumptions about what domain you're in.
+    You must use an FQDN whenever the machine resolving it has no shared
+    "search domain" context with the target. This is always true across
+    the internet and across Azure regions, so backend hostnames here must
+    be FQDNs.
+
+  Short hostname (relative / unqualified)
+    A label without a domain, e.g. just "backend-1".
+    Only works when both machines share a DNS search domain — a suffix the
+    OS appends automatically before querying. Example: if your search domain
+    is "westus2.cloudapp.azure.com", typing "backend-1" resolves to
+    "backend-1.westus2.cloudapp.azure.com" automatically.
+    This works inside a single Azure VNet (where Azure sets a shared
+    internal search domain like "internal.cloudapp.net") but NOT across
+    VNets or regions, and NOT from your laptop. Always use FQDNs for
+    cross-region or internet-facing connections like this project.
+
+NAT (Network Address Translation)
+  Your laptop has a private IP (e.g. 192.168.1.x) that is not routable on
+  the public internet. Your home router (or corporate gateway) rewrites the
+  source IP to its own public IP before the packet leaves — that's NAT.
+  Azure backends see the router's public IP, not your machine's local IP.
+
+  How to find your NAT (public) IP:
+    # From the terminal — asks an external server what IP it sees from you
+    curl https://ifconfig.me
+
+    # Alternatives if that's blocked
+    curl https://api.ipify.org
+    curl https://checkip.amazonaws.com
+
+    # Windows PowerShell
+    (Invoke-WebRequest https://ifconfig.me).Content
+
+  Why this matters for the project:
+    If you SSH into a backend VM and check its access logs, you'll see your
+    NAT IP, not 192.168.x.x. If Azure NSG rules were restricting by source
+    IP, you'd need your NAT IP — not your local IP — to whitelist yourself.
+    NAT also means multiple people on the same network (e.g. campus WiFi)
+    share one public IP, so Azure can't distinguish them by IP alone.
+
+  Reading an IP to identify the network:
+    IPs are allocated in blocks to organizations. Two IPs in the same block
+    belong to the same organization/ISP. You can read this from the address:
+
+      199.204.58.62   — my laptop (UW-Madison campus)
+      199.204.56.22   — campus VM (UW-Madison campus)
+
+    Both are in 199.204.0.0/16, the block registered to UW-Madison. Same
+    organization, but different /24 subnets (58.x vs 56.x) — likely different
+    buildings, VLANs, or departments within the university network.
+
+    The Azure backend VMs have IPs from Microsoft's public ranges (20.x, 40.x,
+    52.x) — a completely different block, owned by a different organization.
+
+  /16 vs /24 — subnet notation
+    The number after the slash is the prefix length: how many bits are fixed.
+      /16  — first 16 bits fixed → 65,536 addresses in the block (199.204.0.0–199.204.255.255)
+      /24  — first 24 bits fixed → 256 addresses in the block (199.204.58.0–199.204.58.255)
+    A /16 is a large allocation (universities, ISPs). A /24 is a typical
+    single subnet — one floor of a building, one VLAN, one department.
+    Two machines in the same /16 but different /24s are in the same
+    organization but routed through different local segments.
+
+================================================================================
+
+CPU & WORKLOAD CONCEPTS
+───────────────────────
+CPU-bound workload
+  Request processing is limited by CPU speed — more cores = more throughput.
+  This project simulates it with a hash computation loop (intensity flag).
+  Backend-1 (1 vCPU pinned) gets saturated faster than backend-3 (4 vCPUs).
+
+I/O-bound workload
+  Request processing blocks waiting on disk or network, not CPU. A single core
+  can handle many concurrent I/O-bound requests. CPU-aware routing (lowest_cpu,
+  intelligent) provides less benefit here since CPU stays low everywhere.
+
+CPU utilization %
+  Fraction of available CPU cycles in use. At 100%, the backend is saturated —
+  new requests queue up, latency spikes. Backend-1 hits this wall much sooner
+  than backend-2 or backend-3 under equal load.
+
+Taskset / CPU pinning
+  Linux tool to restrict a process to specific CPU cores. inteliLB pins
+  backend-1 to a single core via taskset -c 0, even though the VM has 2 vCPUs.
+  This simulates a 1-vCPU machine without paying for a smaller VM SKU.
+
+================================================================================
+
+ROUTING ALGORITHM CONCEPTS
+──────────────────────────
+Round robin
+  Each request goes to the next backend in a circular list. Simple, fair,
+  completely ignorant of backend state. Will overload weak backends equally.
+
+Least connections
+  Send each request to the backend with fewest active connections. Works well
+  when request durations vary a lot. Blind to CPU — a backend can be at 100%
+  CPU with few connections if each request is compute-heavy.
+
+Lowest latency
+  Send to the backend that responded fastest recently. Chases network proximity.
+  Ignores compute state — can pile all traffic onto a nearby but slow backend.
+
+Weighted scoring
+  Normalize each metric to [0,1] across backends, combine with weights, pick
+  lowest score. intelligent uses fixed weights (40% latency, 40% CPU, 20%
+  connections). Requires all metrics to be available (cold-start problem).
+
+Cold start
+  The window after the LB starts before it has real metric data from backends.
+  During this window, metric-based algorithms fall back to round robin.
+  If only one backend has been polled, tie-breaking defaults to backends[0]
+  — the source of backend-1 getting a disproportionate share early on.
+
+Adaptive reweighting
+  Shifting algorithm weights based on observed metric variance. High CPU
+  variance → CPU weight goes up. The 30-second cycle in this project is too
+  slow for short tests — it can be caught mid-adjustment, causing erratic
+  routing (e.g. 0% to backend-2 in the realistic profile).
+
+================================================================================
+
+AZURE-SPECIFIC
+──────────────
+VM SKU
+  The VM size/type (Standard_D2s_v3 = 2 vCPUs, 8 GB RAM). SKU availability
+  varies by region — some SKUs are capacity-constrained in certain regions.
+  That's why the deploy script tries multiple SKU/region combinations for
+  backend-3.
+
+Resource group
+  A logical container for Azure resources. All resources for one backend
+  (VM, NIC, public IP, NSG) live in one resource group. Deleting the group
+  deletes everything in it — that's how teardown works.
+
+NSG (Network Security Group)
+  Azure firewall rules for a VM. The deploy script opens port 8080 via
+  az vm open-port so the LB can reach the backends. All other ports are
+  blocked by default.
+
+Public IP
+  Azure assigns a public IP to each VM so it's reachable from the internet.
+  Without --dns-name at creation time, this is just a raw IP — no hostname.
+  IPs can change if the VM is deallocated and reallocated.
+
+================================================================================

@@ -187,9 +187,9 @@ fi
 
 [[ -f "$AZURE_STATE" ]] || die "Azure state file not found: $AZURE_STATE"
 
-# Parse state file: ip id location rg
+# Parse state file: ip id location rg fqdn
 declare -A BACKEND_IPS BACKEND_REGIONS
-while IFS=' ' read -r ip id location rg; do
+while IFS=' ' read -r ip id location rg fqdn; do
   BACKEND_IPS[$id]="$ip"
   BACKEND_REGIONS[$id]="$location"
 done < "$AZURE_STATE"
