@@ -179,6 +179,67 @@ Taskset / CPU pinning
 
 ================================================================================
 
+NETWORK SECURITY CONCEPTS
+─────────────────────────
+Attack surface
+  Every open port on every machine that can be reached from the internet is
+  part of your attack surface. Minimizing it means closing ports you don't
+  need, restricting who can reach the ones you do, and not exposing internals
+  (like backend servers) that should only be reachable through a controlled
+  entry point (like the LB).
+
+Principle of least privilege
+  Every component should only have access to what it strictly needs.
+  Applied here: backends only need to accept traffic from the LB, not from
+  arbitrary internet IPs. Locking the NSG to 199.204.0.0/16 enforces this —
+  even if someone finds a backend's IP, they can't reach port 8080 from
+  outside the UW network.
+
+Firewall / NSG rule (Network Security Group)
+  A set of allow/deny rules evaluated against incoming packets.
+  Each rule specifies: protocol, port, source IP range, and allow/deny.
+  Azure evaluates rules in priority order (lower number = higher priority)
+  and stops at the first match.
+
+  inteliLB NSG rule for port 8080:
+    priority: 1001
+    protocol: TCP
+    port:     8080
+    source:   199.204.0.0/16   ← only UW-Madison network
+    action:   Allow
+
+  Without a source restriction, the default is 0.0.0.0/0 — the entire
+  internet. That's what az vm open-port creates by default.
+
+Source IP allowlisting
+  Restricting access to a known IP range rather than the whole internet.
+  Trade-off: simple and effective, but only as strong as the network you
+  trust. Anyone on UW's WiFi (199.204.x.x) can still reach the backends —
+  allowlisting a /16 trusts everyone on that campus, not just you.
+  A /32 (single IP) would be tightest but breaks when your NAT IP changes.
+
+Port scanning
+  Automated tools (Shodan, Masscan) continuously sweep the internet for
+  open ports. A fresh Azure VM with port 8080 open to 0.0.0.0/0 will
+  typically appear in scan results within minutes. Even if your backend
+  has no known vulnerabilities, an open port is an invitation to probe.
+  Short-lived VMs (10 min demo) reduce this risk but don't eliminate it.
+
+Defense in depth
+  Layering multiple security controls so that no single failure exposes
+  the system. For this project even with the NSG locked to /16, additional
+  layers could include: requiring an API key on backend requests, running
+  backends on a non-default port, or using an SSH tunnel instead of an
+  open public port entirely.
+
+SSH tunnel (alternative to open ports)
+  Instead of opening port 8080 publicly, the LB could SSH into each backend
+  and forward a local port through the encrypted SSH connection. The backend
+  port never needs to be open to the internet at all — only SSH (port 22)
+  needs to be reachable. More secure, but more setup complexity.
+
+================================================================================
+
 ROUTING ALGORITHM CONCEPTS
 ──────────────────────────
 Round robin

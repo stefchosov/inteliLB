@@ -96,12 +96,23 @@ launch_vm() {
     --query "[0].dnsSettings.fqdn" \
     --output tsv 2>/dev/null || echo "")
 
-  echo "  VM created — opening port 8080..."
-  az vm open-port \
+  # Restrict port 8080 to UW-Madison's /16 only — blocks the open internet
+  # while allowing the LB to reach backends from any campus subnet.
+  echo "  VM created — opening port 8080 (source: 199.204.0.0/16)..."
+  local nsg_name
+  nsg_name=$(az network nsg list \
     --resource-group "$rg" \
-    --name "$id" \
-    --port 8080 \
+    --query "[0].name" \
+    --output tsv)
+  az network nsg rule create \
+    --resource-group "$rg" \
+    --nsg-name "$nsg_name" \
+    --name "allow-lb-8080" \
     --priority 1001 \
+    --protocol Tcp \
+    --destination-port-ranges 8080 \
+    --source-address-prefixes "199.204.0.0/16" \
+    --access Allow \
     --output none
 
   echo "  $id UP at $public_ip ($fqdn)"
