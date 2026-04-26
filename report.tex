@@ -756,18 +756,94 @@ HTTP requests, \texttt{wg.Wait()} completes deterministically, and
 
 \subsection{Connection to CS640 Material}
 
-This project directly exercises core CS640 topics. The load balancer is
-fundamentally a layer-7 routing system, and the algorithm comparison is an
-empirical study of how routing policy affects end-to-end latency and throughput
-in a WAN-scale deployment. The proximity bias observed in lowest-latency routing
-reflects the same tension between link-state shortest-path routing and
-traffic-aware routing studied in the context of OSPF and SDN. The adaptive
-weight recomputation is conceptually similar to congestion-signal-based
-algorithms (DCTCP, BBR) in that it adjusts behaviour based on observed
-network and system state rather than static configuration. The saturation
-curves (Figure~\ref{fig:sat_lat}) exhibit the classic hockey-stick latency
-profile predicted by queueing theory ($M/M/k$ queues), where latency stays
-near the service time until utilisation approaches 100\%, then diverges.
+This project directly exercises the core routing concepts covered in CS640.
+inteliLB is a layer-7 routing system: it maintains a global view of backend
+state, computes a per-request forwarding decision, and updates its policy based
+on observed network and system conditions — the same separation of concerns
+as the control plane / data plane architecture studied in lecture.
+
+\paragraph{The load balancer as a routing processor.}
+The CS640 router architecture identifies the \textit{routing processor} as the
+component that executes routing protocols, maintains routing tables, and computes
+the forwarding table. inteliLB's main goroutine plays exactly this role at layer 7:
+it runs the backend health poller (analogous to OSPF \texttt{hello} heartbeats),
+maintains the backend state table (the link-state database), and computes a
+forwarding decision for every incoming HTTP request.
+
+\paragraph{ARPANET link-cost metrics and multi-metric scoring.}
+The CS640 lectures trace three generations of ARPANET routing metrics.
+Metric 1 (hop count) ignores load entirely — the analogue in inteliLB is
+round-robin. Metric 2 (queue length, i.e.\ packets enqueued) routes toward the
+shortest queue regardless of whether that queue leads to the right destination —
+the analogue is \texttt{least\_connections}, which the experiments confirm
+over-concentrates traffic on backend-1. Metric 3 (average delay over a sliding
+window, $\text{Delay} = (D_T - A_T) + T_{\text{transmit}} + T_{\text{latency}}$)
+routes by observed end-to-end delay — the analogue is \texttt{lowest\_latency}.
+The ARPANET finding that no single metric suffices directly motivates
+inteliLB's weighted combination:
+\[
+  \text{score}_i = w_L\,\hat{l}_i + w_C\,\hat{c}_i + w_K\,\hat{k}_i
+\]
+where latency, CPU, and connection count are normalised and blended so that
+over-optimising one dimension does not degrade the others.
+
+\paragraph{Dijkstra and centralized global-state routing.}
+Link-state routing (OSPF) floods topology information to every node so each
+can run Dijkstra locally over a complete global view. inteliLB follows the same
+model at the application layer: the load balancer polls every backend every 5\,s
+to maintain a complete, current view of the system, then scores all backends in
+$O(n)$ to pick the best next hop for each request. The centralized, globally-informed
+decision is what distinguishes \texttt{intelligent} and \texttt{adaptive} from
+the reactive, locally-scoped heuristics (\texttt{lowest\_latency},
+\texttt{lowest\_cpu}) that consider only one dimension at a time.
+
+\paragraph{Convergence, cold start, and transient disruption.}
+The CS640 treatment of link-state convergence identifies two failure modes:
+(1)~a detection-delay black hole, where a node continues forwarding to a failed
+neighbor until heartbeat timeouts expire; and (2)~inconsistent link-state, where
+routers that have not yet received a flooded update make contradictory forwarding
+decisions. Both appear in inteliLB. The cold-start window — before any backend
+has been polled — is the detection-delay analogue: metric-based algorithms have
+no cost information and fall back to round-robin to avoid routing into an
+unknown-state backend. The 5-second poll interval is the convergence window:
+during it, the load balancer's view of backend CPU and latency may be stale,
+causing transient mis-routing analogous to the inconsistent link-state window
+during OSPF flooding.
+
+\paragraph{Link-state vs.\ distance-vector trade-off.}
+CS640 contrasts link-state (high messaging overhead, fast convergence) with
+distance-vector (low overhead, slow convergence and count-to-infinity risk).
+inteliLB's polling architecture is a link-state model: the single load balancer
+polls all backends directly, incurring $O(n)$ messages per interval but
+converging in one round. A gossip-based, peer-to-peer health model would be the
+distance-vector analogue — lower polling overhead at the cost of slower,
+potentially inconsistent convergence. The current single-LB design is also
+structurally vulnerable to the inconsistent-state pathology when scaled to
+multiple LB instances without coordination, exactly as un-synchronized routers
+produce transient forwarding loops during topology changes.
+
+\paragraph{Adaptive recomputation and periodic flooding.}
+OSPF floods link-state packets both on topology events (link failure) and
+periodically (every $\sim$30 minutes) to ensure consistency. inteliLB's
+adaptive algorithm mirrors this dual trigger: the 5-second poller is the
+event-driven channel (detects backend CPU and latency shifts), while the
+30-second weight recomputation is the periodic recalculation that adjusts
+the routing policy even when no discrete event has occurred. The 30-second
+interval proved too coarse in the experiments — the adaptive algorithm was
+frequently caught mid-adjustment during the 120-second test windows, producing
+erratic distributions (0\% to one backend in the realistic profile), consistent
+with the transient disruptions that occur when periodic flooding intervals are
+too long relative to the rate of topology change.
+
+\paragraph{Saturation and queueing theory.}
+The saturation ramp results (Figure~\ref{fig:sat_lat}) exhibit the classic
+hockey-stick latency profile predicted by $M/M/k$ queueing theory: latency
+remains near the service time until utilisation approaches 100\%, then diverges.
+\texttt{intelligent} sustains clean throughput to 150\,req/s before saturation
+while \texttt{round\_robin} and \texttt{lowest\_latency} collapse earlier,
+because smarter routing keeps all $k$ servers below their individual saturation
+points longer — directly applying the CS640 insight that load distribution
+determines effective system capacity.
 
 % ─────────────────────────────────────────────────────────────────────────────
 \begin{thebibliography}{9}
