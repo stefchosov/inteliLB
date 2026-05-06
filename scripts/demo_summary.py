@@ -36,23 +36,27 @@ for algo in ALGORITHMS:
     ))
 
 print()
+
+# Read backend distribution from per-request CSVs (not stats JSON, which is
+# cumulative across the LB process lifetime and will show misleading splits
+# if the LB was not restarted between algorithm switches).
 dist = "{:<22} {:<14} {:<14} {:<14}"
 print(dist.format("Algorithm", "backend-1 %", "backend-2 %", "backend-3 %"))
 print("-" * 62)
 
 for algo in ALGORITHMS:
-    spath = os.path.join(results_dir, f"{algo}_stats.json")
-    if not os.path.exists(spath):
+    path = os.path.join(results_dir, f"{algo}.csv")
+    if not os.path.exists(path):
         continue
-    try:
-        data = json.load(open(spath))
-        bs   = data.get("backends", [])
-        tot  = sum(b.get("total_requests", 0) for b in bs)
-        if tot == 0:
-            continue
-        pcts = [f"{b.get('total_requests', 0) / tot * 100:.1f}%" for b in bs]
-        while len(pcts) < 3:
-            pcts.append("n/a")
-        print(dist.format(algo, *pcts[:3]))
-    except Exception:
-        pass
+    rows = list(csv.DictReader(open(path)))
+    total = len(rows)
+    if total == 0:
+        continue
+    counts = {}
+    for r in rows:
+        b = r.get("backend_id", "?")
+        counts[b] = counts.get(b, 0) + 1
+    pcts = []
+    for b in ["backend-1", "backend-2", "backend-3"]:
+        pcts.append(f"{counts.get(b, 0) / total * 100:.1f}%")
+    print(dist.format(algo, *pcts))

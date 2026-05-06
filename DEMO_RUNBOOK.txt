@@ -38,6 +38,11 @@ All three should show "healthy": true. If any don't, stop and debug before demoi
 
   mkdir -p results/demo
 
+IMPORTANT: Restart the LB process (Ctrl+C in Terminal A, then re-run) between each
+algorithm switch. The /lb/stats counters are cumulative for the lifetime of the process
+— if you don't restart, the backend distribution shown by demo_summary.py will include
+all previous runs and look like a split even for algorithms that route to a single backend.
+
 ================================================================================
 2. RUN THE ALGORITHMS
 ================================================================================
@@ -67,9 +72,7 @@ round_robin  (1/6)
 lowest_latency  (2/6)
 ────────────────────────────────
 
-  curl -s -X POST http://localhost:8080/lb/algorithm \
-    -H "Content-Type: application/json" \
-    -d '{"algorithm":"lowest_latency"}' | python3 -m json.tool
+  Restart LB in Terminal A with -algorithm=lowest_latency (or Ctrl+C and re-run).
 
   go run ./cmd/client \
     -url=http://localhost:8080 \
@@ -81,16 +84,16 @@ lowest_latency  (2/6)
   curl -s http://localhost:8080/lb/stats > results/demo/lowest_latency_stats.json
   echo "cooling..."; sleep 20
 
-  Point out: traffic chases the closest backend. Can still pile onto one backend
-  if it happens to look fast at the start — doesn't know anything about CPU.
+  Point out: routes 100% to backend-2 (northcentralus, ~14ms RTT) — pure network
+  proximity. Optimal for I/O-bound work but concentrates all CPU-heavy traffic on
+  a 2-vCPU backend while backend-3's 4 vCPUs sit completely idle. Saturates at
+  75 req/s in the full sweep.
 
 ────────────────────────────────
 least_connections  (3/6)
 ────────────────────────────────
 
-  curl -s -X POST http://localhost:8080/lb/algorithm \
-    -H "Content-Type: application/json" \
-    -d '{"algorithm":"least_connections"}' | python3 -m json.tool
+  Restart LB in Terminal A with -algorithm=least_connections.
 
   go run ./cmd/client \
     -url=http://localhost:8080 \
@@ -102,16 +105,16 @@ least_connections  (3/6)
   curl -s http://localhost:8080/lb/stats > results/demo/least_connections_stats.json
   echo "cooling..."; sleep 20
 
-  Point out: completely blind to CPU. When all connection counts tie (which happens
-  a lot), it defaults to backend-1 every time — the tie-breaking bug I found.
+  Point out: tracks in-flight requests per backend — no polling needed. Backend-3
+  (4 vCPU) drains connections faster so it attracts more traffic implicitly.
+  Best p99 of any algorithm on CPU-bound workloads. RTT tiebreaker prevents
+  tie-breaking bias toward backend-1.
 
 ────────────────────────────────
 lowest_cpu  (4/6)
 ────────────────────────────────
 
-  curl -s -X POST http://localhost:8080/lb/algorithm \
-    -H "Content-Type: application/json" \
-    -d '{"algorithm":"lowest_cpu"}' | python3 -m json.tool
+  Restart LB in Terminal A with -algorithm=lowest_cpu.
 
   go run ./cmd/client \
     -url=http://localhost:8080 \
@@ -123,17 +126,16 @@ lowest_cpu  (4/6)
   curl -s http://localhost:8080/lb/stats > results/demo/lowest_cpu_stats.json
   echo "cooling..."; sleep 20
 
-  Point out: almost everything goes to backend-3 (4 vCPUs, lowest CPU).
-  Good at avoiding overload but ignores network — backend-3 might be geographically
-  further away, so latency can actually get worse.
+  Point out: correctly avoids backend-1 (~18% share) since it sits at 100% CPU.
+  However CPU% doesn't distinguish capacity — a 4-vCPU backend doing 4x the work
+  reports similar CPU% to a 1-vCPU backend doing 1x the work, so routing between
+  b2 and b3 is noisy.
 
 ────────────────────────────────
 intelligent  (5/6)
 ────────────────────────────────
 
-  curl -s -X POST http://localhost:8080/lb/algorithm \
-    -H "Content-Type: application/json" \
-    -d '{"algorithm":"intelligent"}' | python3 -m json.tool
+  Restart LB in Terminal A with -algorithm=intelligent.
 
   go run ./cmd/client \
     -url=http://localhost:8080 \
@@ -147,15 +149,14 @@ intelligent  (5/6)
 
   Point out: static weights — 40% latency, 40% CPU, 20% connections. Normalizes
   all three metrics and picks the best combined score. Avoids backend-1 without
-  blindly dumping everything on backend-3.
+  blindly dumping everything on backend-3. Sustains clean operation to 150 req/s
+  in the full sweep — one step below the cluster ceiling.
 
 ────────────────────────────────
 adaptive  (6/6 — no cooldown)
 ────────────────────────────────
 
-  curl -s -X POST http://localhost:8080/lb/algorithm \
-    -H "Content-Type: application/json" \
-    -d '{"algorithm":"adaptive"}' | python3 -m json.tool
+  Restart LB in Terminal A with -algorithm=adaptive.
 
   go run ./cmd/client \
     -url=http://localhost:8080 \
@@ -166,10 +167,10 @@ adaptive  (6/6 — no cooldown)
 
   curl -s http://localhost:8080/lb/stats > results/demo/adaptive_stats.json
 
-  Point out: same as intelligent but the weights shift every 30s based on how much
-  variance there is across backends. In this 30s run it gets one recompute cycle.
-  In the full 120s experiment it converges further — CPU variance is high so it
-  effectively becomes lowest_cpu dynamically.
+  Point out: same as intelligent but weights recompute every 10s based on metric
+  variance across backends. In this 30s run it gets ~3 recompute cycles. Under
+  CPU-heavy load, CPU variance is high so it shifts weight toward CPU and behaves
+  more like lowest_cpu dynamically.
 
 ================================================================================
 3. SUMMARY TABLE
@@ -200,17 +201,21 @@ Why 3 backends with different vCPUs?
   VM generations. If all backends were identical, routing strategy wouldn't matter.
 
 Why does backend-1 get so many requests with some algorithms?
-  Tie-breaking bug — least_connections and lowest_cpu both initialize to backends[0]
-  and only switch on a strict less-than. When metrics are equal at startup, backend-1
-  wins every single decision.
+  Round-robin gives it exactly 33% by design. For metric-based algorithms,
+  backend-1 (1 vCPU, taskset-pinned) sits at ~100% CPU under load so lowest_cpu
+  correctly routes only ~18% there. An RTT tiebreaker on least_connections and
+  lowest_cpu prevents tie-breaking bias toward backend-1 when primary metrics
+  are equal.
 
 Why is intelligent better than just lowest_cpu?
   lowest_cpu ignores network entirely. If the lowest-CPU backend is far away,
   you trade CPU headroom for worse latency. Intelligent blends both so you don't
-  tank one metric to optimize the other.
+  tank one metric to optimize the other. Also CPU% can't distinguish capacity —
+  a 4-vCPU backend doing 4x the work reports similar CPU% to a 1-vCPU backend,
+  so lowest_cpu routing between b2 and b3 is noisy.
 
 What does adaptive actually add over intelligent?
-  Intelligent has fixed weights (40/40/20). Adaptive figures out which metric is
-  actually varying most right now and weights that higher. Under CPU-heavy load it
-  becomes more like lowest_cpu. Under uniform load it backs off and weights more
-  evenly.
+  Intelligent has fixed weights (40/40/20). Adaptive recomputes weights every 10s
+  based on which metric has the most variance across backends. Under CPU-heavy load
+  it shifts toward lowest_cpu behaviour. Under uniform load it backs off and weights
+  more evenly. The 10s interval gives ~3 recomputation cycles in a 30s demo run.
